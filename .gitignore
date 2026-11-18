@@ -1,0 +1,28 @@
+# Variables de entorno locales (nunca versionar secretos reales)
+.env
+.env.local
+.env.*.local
+
+# Maven / Java
+target/
+!.mvn/wrapper/maven-wrapper.jar
+*.class
+*.jar
+*.war
+*.ear
+
+# IDEs
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.classpath
+.project
+
+# Logs y temporales
+*.log
+logs/
+.DS_Store
+Thumbs.db
