@@ -6,7 +6,7 @@ El sistema opera como una arquitectura de microservicios autocontenida en conten
 
 ```mermaid
 flowchart TB
-    Client["Cliente / App Billetera / Postman / Script P02"]
+    Client["Cliente / App Billetera / curl / Script P02"]
 
     subgraph Edge["Capa de Entrada y Descubrimiento"]
         GW["Spring Cloud Gateway :8080\nlb://ms-cuentas | lb://ms-transacciones"]

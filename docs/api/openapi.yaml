@@ -1,0 +1,637 @@
+openapi: 3.0.3
+info:
+  title: API Billetera Digital y Transferencias P2P
+  version: 1.0.0
+  description: >
+    Contrato REST unificado expuesto por api-gateway (:8080) hacia los microservicios
+    ms-cuentas y ms-transacciones con soporte de enrutamiento CQRS ligero, consistencia
+    Read-Your-Own-Writes (RYOW) y trazabilidad de nodo PostgreSQL.
+servers:
+  - url: http://localhost:8080
+    description: API Gateway (punto unico de entrada HTTP)
+
+tags:
+  - name: Cuentas
+    description: Gestion de billeteras, saldos, contactos y movimientos internos (ms-cuentas)
+  - name: Transacciones
+    description: Orquestacion de transferencias P2P, historial y comprobantes (ms-transacciones)
+  - name: Diagnostico
+    description: Observabilidad de instancias y salud de replicas PostgreSQL
+
+paths:
+  /api/cuentas/{celular}:
+    get:
+      tags: [Cuentas]
+      summary: Consulta ordinaria de perfil y saldo de cuenta
+      parameters:
+        - $ref: '#/components/parameters/CelularPath'
+        - $ref: '#/components/parameters/ConsistenciaHeader'
+      responses:
+        '200':
+          description: Cuenta encontrada
+          headers:
+            X-Gateway-Handled:
+              $ref: '#/components/headers/XGatewayHandled'
+            X-Service-Instance:
+              $ref: '#/components/headers/XServiceInstance'
+            X-Db-Node:
+              $ref: '#/components/headers/XDbNode'
+            X-Db-Fallback:
+              $ref: '#/components/headers/XDbFallback'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseCuenta'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /api/cuentas/{celular}/contactos:
+    get:
+      tags: [Cuentas]
+      summary: Lista de contactos frecuentes de una cuenta (REPLICA)
+      parameters:
+        - $ref: '#/components/parameters/CelularPath'
+      responses:
+        '200':
+          description: Contactos frecuentes obtenidos
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseContactos'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /api/cuentas/{celular}/saldo-critico:
+    get:
+      tags: [Cuentas]
+      summary: Consulta critica de saldo inmediato RYOW (PRIMARY obligatorio)
+      parameters:
+        - $ref: '#/components/parameters/CelularPath'
+      responses:
+        '200':
+          description: Saldo actualizado en el nodo Primario
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseSaldoCritico'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /api/cuentas/instancia:
+    get:
+      tags: [Cuentas]
+      summary: Endpoint liviano de diagnostico para pruebas de balanceo P02/P03 (REPLICA)
+      responses:
+        '200':
+          description: Instancia y nodo de base de datos reportados
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseInstancia'
+
+  /api/cuentas:
+    post:
+      tags: [Cuentas]
+      summary: Alta de nueva cuenta de billetera (PRIMARY)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CrearCuentaRequest'
+      responses:
+        '201':
+          description: Cuenta creada exitosamente
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseCuenta'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
+
+  /api/cuentas/movimiento-interno:
+    post:
+      tags: [Cuentas]
+      summary: Debito y credito atomico entre cuentas (consumido por ms-transacciones, PRIMARY)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MovimientoInternoRequest'
+      responses:
+        '200':
+          description: Movimiento aplicado atomicamente
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseMovimientoInterno'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
+
+  /api/cuentas/db/estado:
+    get:
+      tags: [Diagnostico]
+      summary: Estado en tiempo real de replicas y conteo de consultas de ms-cuentas
+      responses:
+        '200':
+          description: Snapshot de salud de replicas PostgreSQL
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DbEstadoResponse'
+
+  /api/transacciones/transferir:
+    post:
+      tags: [Transacciones]
+      summary: Orquestacion de transferencia P2P (PRIMARY + lb://ms-cuentas)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransferenciaRequest'
+      responses:
+        '201':
+          description: Transferencia ejecutada y comprobante emitido
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseComprobante'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableError'
+
+  /api/transacciones/historial/{celular}:
+    get:
+      tags: [Transacciones]
+      summary: Historial de transferencias donde participa el celular (REPLICA)
+      parameters:
+        - $ref: '#/components/parameters/CelularPath'
+      responses:
+        '200':
+          description: Lista ordenada descendentemente por fechaHora
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseHistorial'
+
+  /api/transacciones/comprobante/{codigo}:
+    get:
+      tags: [Transacciones]
+      summary: Verificacion critica de comprobante recien emitido RYOW (PRIMARY)
+      parameters:
+        - name: codigo
+          in: path
+          required: true
+          schema:
+            type: string
+          example: TX-2026-0001
+      responses:
+        '200':
+          description: Comprobante encontrado en nodo Primario
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseTransaccion'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /api/transacciones/db/estado:
+    get:
+      tags: [Diagnostico]
+      summary: Estado en tiempo real de replicas y conteo de consultas de ms-transacciones
+      responses:
+        '200':
+          description: Snapshot de salud de replicas PostgreSQL
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DbEstadoResponse'
+
+components:
+  parameters:
+    CelularPath:
+      name: celular
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 7
+        maxLength: 20
+      example: '0991112233'
+    ConsistenciaHeader:
+      name: X-Consistencia
+      in: header
+      required: false
+      description: Si vale CRITICA, fuerza la lectura ordinaria al nodo PRIMARY.
+      schema:
+        type: string
+        enum: [EVENTUAL, CRITICA]
+
+  headers:
+    XGatewayHandled:
+      schema:
+        type: string
+      example: api-gateway
+    XServiceInstance:
+      schema:
+        type: string
+      example: ms-cuentas-1:8081
+    XDbNode:
+      schema:
+        type: string
+      example: REPLICA_1 (172.18.0.3:5432)
+    XDbFallback:
+      schema:
+        type: string
+        enum: ['true', 'false']
+
+  responses:
+    BadRequestError:
+      description: Datos de entrada invalidos
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiResponseError'
+    NotFoundError:
+      description: Recurso no encontrado
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiResponseError'
+    ConflictError:
+      description: Regla de negocio financiera violada
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiResponseError'
+    ServiceUnavailableError:
+      description: Microservicio dependiente no disponible en Eureka
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiResponseError'
+
+  schemas:
+    AuditoriaTecnica:
+      type: object
+      required: [servicioOrigen, nodoBaseDatos, politicaEnrutamiento]
+      properties:
+        servicioOrigen:
+          type: string
+          example: ms-transacciones:8083
+        instanciaCuentasConsultada:
+          type: string
+          nullable: true
+          example: ms-cuentas-2:8082
+        nodoBaseDatos:
+          type: string
+          example: PRIMARY (172.18.0.2:5432, recovery=false)
+        politicaEnrutamiento:
+          type: string
+          enum:
+            - ESCRITURA_DIRECTA
+            - LECTURA_CRITICA_PRIMARIO
+            - ROUND_ROBIN_REPLICA
+            - FAILOVER_REPLICA
+
+    CuentaDto:
+      type: object
+      properties:
+        numeroCelular:
+          type: string
+        titular:
+          type: string
+        saldo:
+          type: number
+          format: double
+        limiteDiario:
+          type: number
+          format: double
+        consumidoHoy:
+          type: number
+          format: double
+        estado:
+          type: string
+          enum: [ACTIVA, BLOQUEADA]
+
+    ContactoDto:
+      type: object
+      properties:
+        celularContacto:
+          type: string
+        alias:
+          type: string
+
+    SaldoCriticoDto:
+      type: object
+      properties:
+        numeroCelular:
+          type: string
+        saldo:
+          type: number
+          format: double
+        limiteDiario:
+          type: number
+          format: double
+        consumidoHoy:
+          type: number
+          format: double
+        consultadoEn:
+          type: string
+          format: date-time
+
+    InstanciaDto:
+      type: object
+      properties:
+        instancia:
+          type: string
+        puerto:
+          type: integer
+        timestamp:
+          type: string
+          format: date-time
+
+    CrearCuentaRequest:
+      type: object
+      required: [numeroCelular, titular, saldo, limiteDiario]
+      properties:
+        numeroCelular:
+          type: string
+          example: '0951234567'
+        titular:
+          type: string
+          example: Mario Ruiz
+        saldo:
+          type: number
+          minimum: 0
+          example: 250.00
+        limiteDiario:
+          type: number
+          exclusiveMinimum: true
+          minimum: 0
+          example: 150.00
+
+    MovimientoInternoRequest:
+      type: object
+      required: [celularOrigen, celularDestino, monto]
+      properties:
+        celularOrigen:
+          type: string
+          example: '0991112233'
+        celularDestino:
+          type: string
+          example: '0984445566'
+        monto:
+          type: number
+          minimum: 0.01
+          example: 25.00
+
+    MovimientoInternoResponse:
+      type: object
+      properties:
+        celularOrigen:
+          type: string
+        celularDestino:
+          type: string
+        monto:
+          type: number
+          format: double
+        nuevoSaldoOrigen:
+          type: number
+          format: double
+        nuevoSaldoDestino:
+          type: number
+          format: double
+        instanciaAtendio:
+          type: string
+
+    TransferenciaRequest:
+      type: object
+      required: [celularOrigen, celularDestino, monto, motivo]
+      properties:
+        celularOrigen:
+          type: string
+          example: '0991112233'
+        celularDestino:
+          type: string
+          example: '0984445566'
+        monto:
+          type: number
+          minimum: 0.01
+          example: 25.00
+        motivo:
+          type: string
+          maxLength: 160
+          example: Pago almuerzo compartido
+
+    ComprobanteDto:
+      type: object
+      properties:
+        codigoComprobante:
+          type: string
+        celularOrigen:
+          type: string
+        celularDestino:
+          type: string
+        monto:
+          type: number
+          format: double
+        motivo:
+          type: string
+        estado:
+          type: string
+          enum: [EXITOSA, RECHAZADA]
+        nuevoSaldoOrigen:
+          type: number
+          format: double
+        fechaHora:
+          type: string
+          format: date-time
+
+    TransaccionDto:
+      type: object
+      properties:
+        codigoComprobante:
+          type: string
+        celularOrigen:
+          type: string
+        celularDestino:
+          type: string
+        monto:
+          type: number
+          format: double
+        motivo:
+          type: string
+        estado:
+          type: string
+          enum: [EXITOSA, RECHAZADA]
+        fechaHora:
+          type: string
+          format: date-time
+
+    ReplicaEstadoItem:
+      type: object
+      properties:
+        nodo:
+          type: string
+          enum: [REPLICA_1, REPLICA_2]
+        available:
+          type: boolean
+        consecutiveSuccesses:
+          type: integer
+        lastReplayLsn:
+          type: string
+          nullable: true
+        lastError:
+          type: string
+          nullable: true
+        lastCheckedAt:
+          type: string
+          format: date-time
+
+    DbEstadoResponse:
+      type: object
+      properties:
+        servicio:
+          type: string
+        consultasTotales:
+          type: object
+          properties:
+            PRIMARY:
+              type: integer
+            REPLICA_1:
+              type: integer
+            REPLICA_2:
+              type: integer
+        replicas:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReplicaEstadoItem'
+
+    ApiResponseError:
+      type: object
+      properties:
+        estado:
+          type: string
+          example: ERROR
+        mensaje:
+          type: string
+        datos:
+          nullable: true
+          example: null
+        auditoriaTecnica:
+          $ref: '#/components/schemas/AuditoriaTecnica'
+
+    ApiResponseCuenta:
+      type: object
+      properties:
+        estado:
+          type: string
+          example: OK
+        mensaje:
+          type: string
+        datos:
+          $ref: '#/components/schemas/CuentaDto'
+        auditoriaTecnica:
+          $ref: '#/components/schemas/AuditoriaTecnica'
+
+    ApiResponseContactos:
+      type: object
+      properties:
+        estado:
+          type: string
+        mensaje:
+          type: string
+        datos:
+          type: array
+          items:
+            $ref: '#/components/schemas/ContactoDto'
+        auditoriaTecnica:
+          $ref: '#/components/schemas/AuditoriaTecnica'
+
+    ApiResponseSaldoCritico:
+      type: object
+      properties:
+        estado:
+          type: string
+        mensaje:
+          type: string
+        datos:
+          $ref: '#/components/schemas/SaldoCriticoDto'
+        auditoriaTecnica:
+          $ref: '#/components/schemas/AuditoriaTecnica'
+
+    ApiResponseInstancia:
+      type: object
+      properties:
+        estado:
+          type: string
+        mensaje:
+          type: string
+        datos:
+          $ref: '#/components/schemas/InstanciaDto'
+        auditoriaTecnica:
+          $ref: '#/components/schemas/AuditoriaTecnica'
+
+    ApiResponseMovimientoInterno:
+      type: object
+      properties:
+        estado:
+          type: string
+        mensaje:
+          type: string
+        datos:
+          $ref: '#/components/schemas/MovimientoInternoResponse'
+        auditoriaTecnica:
+          $ref: '#/components/schemas/AuditoriaTecnica'
+
+    ApiResponseComprobante:
+      type: object
+      properties:
+        estado:
+          type: string
+        mensaje:
+          type: string
+        datos:
+          $ref: '#/components/schemas/ComprobanteDto'
+        auditoriaTecnica:
+          $ref: '#/components/schemas/AuditoriaTecnica'
+
+    ApiResponseTransaccion:
+      type: object
+      properties:
+        estado:
+          type: string
+        mensaje:
+          type: string
+        datos:
+          $ref: '#/components/schemas/TransaccionDto'
+        auditoriaTecnica:
+          $ref: '#/components/schemas/AuditoriaTecnica'
+
+    ApiResponseHistorial:
+      type: object
+      properties:
+        estado:
+          type: string
+        mensaje:
+          type: string
+        datos:
+          type: array
+          items:
+            $ref: '#/components/schemas/TransaccionDto'
+        auditoriaTecnica:
+          $ref: '#/components/schemas/AuditoriaTecnica'

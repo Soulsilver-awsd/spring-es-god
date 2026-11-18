@@ -23,7 +23,7 @@
 
 | Actor | Tipo | Descripción e Interacción |
 |---|---|---|
-| **Cliente / Usuario de Billetera** | Humano (vía App/Postman/curl) | Consulta su perfil, saldo y contactos; ejecuta transferencias P2P; verifica inmediatamente su nuevo saldo y comprobante. |
+| **Cliente / Usuario de Billetera** | Humano (vía App/`curl`) | Consulta su perfil, saldo y contactos; ejecuta transferencias P2P; verifica inmediatamente su nuevo saldo y comprobante. |
 | **Operador / Evaluador de Infraestructura** | Humano / Script experimental | Inspecciona el tablero de Eureka, ejecuta ráfagas de carga (100+ req), provoca fallos controlados (`stop`/`kill` de instancias y réplicas) y verifica recuperación. |
 | **API Gateway (`api-gateway`)** | Componente de borde | Recibe toda petición externa en el puerto `:8080` y la enruta dinámicamente mediante `lb://`. |
 | **Microservicio Transacciones (`ms-transacciones`)** | Actor interno de negocio | Consume internamente a `ms-cuentas` vía `http://ms-cuentas/api/cuentas/movimiento-interno` para ejecutar débito/crédito antes de registrar la transacción. |

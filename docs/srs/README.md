@@ -4,7 +4,8 @@
 **Estándar de referencia:** ISO/IEC/IEEE 29148 / IEEE 830  
 **Versión del documento:** `1.0.0`  
 **Fecha:** `2026-11-18`  
-**Stack objetivo:** Java 21 · Spring Boot 3.4.3 · Spring Cloud 2024.0.1 (Eureka, Gateway, LoadBalancer) · PostgreSQL 17 (1 Primario + 2 Réplicas WAL) · Docker Compose
+**Stack objetivo:** Java 21 · Spring Boot 3.4.3 · Spring Cloud 2024.0.1 (Eureka, Gateway, LoadBalancer) · PostgreSQL 17 (1 Primario + 2 Réplicas WAL) · Docker Compose  
+**Documento de arquitectura asociado:** [SAD Modular (Modelo C4 + ADRs)](../sad/README.md) · [SDD Modular (IEEE 1016)](../sdd/README.md)
 
 ---
 
