@@ -1,0 +1,12 @@
+docker compose exec primary psql -U admin -d laboratorio -c "CREATE TABLE prueba_replica (id SERIAL PRIMARY KEY,mensaje TEXT,fecha TIMESTAMP DEFAULT NOW());"
+
+
+docker compose exec primary psql -U admin -d laboratorio -c "INSERT INTO prueba_replica (mensaje) VALUES ('Hola desde el nodo primario');"
+
+
+docker compose exec replica1 psql -U admin -d laboratorio -c "SELECT * FROM prueba_replica;"
+
+docker compose exec replica2 psql -U admin -d laboratorio -c "SELECT * FROM prueba_replica;"
+
+
+docker compose exec replica1 psql -U admin -d laboratorio -c "INSERT INTO prueba_replica (mensaje) VALUES ('Intentando escribir en replica');"

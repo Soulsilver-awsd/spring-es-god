@@ -1,0 +1,56 @@
+services:
+  primary:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin_demo_change_me
+      POSTGRES_DB: laboratorio
+      REPLICATION_PASSWORD: replica_demo_change_me
+    command: ["postgres", "-c", "wal_level=replica", "-c", "max_wal_senders=10", "-c", "wal_keep_size=256MB", "-c", "hot_standby=on"]
+    volumes:
+      - primary_data:/var/lib/postgresql/data
+      - ./primary-init.sh:/docker-entrypoint-initdb.d/01-replication.sh:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d laboratorio"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  replica1:
+    image: postgres:17
+    user: postgres
+    environment:
+      PGDATA: /var/lib/postgresql/data
+      PGPASSWORD: replica_demo_change_me
+    entrypoint: ["/bin/bash", "/scripts/start-replica.sh"]
+    volumes:
+      - replica1_data:/var/lib/postgresql/data
+      - ./start-replica.sh:/scripts/start-replica.sh:ro
+    ports:
+      - "5433:5432"
+    depends_on:
+      primary:
+        condition: service_healthy
+
+  replica2:
+    image: postgres:17
+    user: postgres
+    environment:
+      PGDATA: /var/lib/postgresql/data
+      PGPASSWORD: replica_demo_change_me
+    entrypoint: ["/bin/bash", "/scripts/start-replica.sh"]
+    volumes:
+      - replica2_data:/var/lib/postgresql/data
+      - ./start-replica.sh:/scripts/start-replica.sh:ro
+    ports:
+      - "5434:5432"
+    depends_on:
+      primary:
+        condition: service_healthy
+
+volumes:
+  primary_data:
+  replica1_data:
+  replica2_data:
