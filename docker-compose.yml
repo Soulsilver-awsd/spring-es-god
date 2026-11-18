@@ -1,54 +1,88 @@
 services:
   primary:
     image: postgres:17
+    container_name: postgres-primary
     environment:
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD: admin_demo_change_me
-      POSTGRES_DB: laboratorio
-      REPLICATION_PASSWORD: replica_demo_change_me
-    command: ["postgres", "-c", "wal_level=replica", "-c", "max_wal_senders=10", "-c", "wal_keep_size=256MB", "-c", "hot_standby=on"]
+      POSTGRES_USER: ${POSTGRES_USER:?Define POSTGRES_USER en .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Define POSTGRES_PASSWORD en .env}
+      POSTGRES_DB: ${POSTGRES_DB:?Define POSTGRES_DB en .env}
+      REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:?Define REPLICATION_PASSWORD en .env}
+      CUENTAS_DB_USER: ${CUENTAS_DB_USER:?Define CUENTAS_DB_USER en .env}
+      CUENTAS_DB_PASSWORD: ${CUENTAS_DB_PASSWORD:?Define CUENTAS_DB_PASSWORD en .env}
+      TX_DB_USER: ${TX_DB_USER:?Define TX_DB_USER en .env}
+      TX_DB_PASSWORD: ${TX_DB_PASSWORD:?Define TX_DB_PASSWORD en .env}
+    command:
+      [
+        "postgres",
+        "-c", "wal_level=replica",
+        "-c", "max_wal_senders=10",
+        "-c", "wal_keep_size=256MB",
+        "-c", "hot_standby=on"
+      ]
     volumes:
       - primary_data:/var/lib/postgresql/data
       - ./primary-init.sh:/docker-entrypoint-initdb.d/01-replication.sh:ro
     ports:
       - "5432:5432"
+    networks:
+      - wallet-net
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U admin -d laboratorio"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 3s
       retries: 20
 
   replica1:
     image: postgres:17
+    container_name: postgres-replica-1
     user: postgres
     environment:
       PGDATA: /var/lib/postgresql/data
-      PGPASSWORD: replica_demo_change_me
+      PGPASSWORD: ${REPLICATION_PASSWORD:?Define REPLICATION_PASSWORD en .env}
     entrypoint: ["/bin/bash", "/scripts/start-replica.sh"]
     volumes:
       - replica1_data:/var/lib/postgresql/data
       - ./start-replica.sh:/scripts/start-replica.sh:ro
     ports:
       - "5433:5432"
+    networks:
+      - wallet-net
     depends_on:
       primary:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   replica2:
     image: postgres:17
+    container_name: postgres-replica-2
     user: postgres
     environment:
       PGDATA: /var/lib/postgresql/data
-      PGPASSWORD: replica_demo_change_me
+      PGPASSWORD: ${REPLICATION_PASSWORD:?Define REPLICATION_PASSWORD en .env}
     entrypoint: ["/bin/bash", "/scripts/start-replica.sh"]
     volumes:
       - replica2_data:/var/lib/postgresql/data
       - ./start-replica.sh:/scripts/start-replica.sh:ro
     ports:
       - "5434:5432"
+    networks:
+      - wallet-net
     depends_on:
       primary:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+networks:
+  wallet-net:
+    driver: bridge
 
 volumes:
   primary_data:
