@@ -1,0 +1,12 @@
+# Contexto de build de los Dockerfile multi-etapa (raiz del repositorio)
+.env
+.env.*
+!.env.example
+.git
+.atl
+.idea
+.vscode
+**/target
+docs
+*.md
+*.log
