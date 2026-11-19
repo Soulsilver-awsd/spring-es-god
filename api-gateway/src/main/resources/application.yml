@@ -1,0 +1,55 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: api-gateway
+  cloud:
+    loadbalancer:
+      cache:
+        ttl: 3s
+    gateway:
+      discovery:
+        locator:
+          enabled: false
+      routes:
+        - id: cuentas-db-estado
+          uri: lb://ms-cuentas
+          predicates:
+            - Path=/api/cuentas/db/{segment}
+          filters:
+            - SetPath=/api/db/{segment}
+
+        - id: cuentas-api
+          uri: lb://ms-cuentas
+          predicates:
+            - Path=/api/cuentas/**
+
+        - id: transacciones-db-estado
+          uri: lb://ms-transacciones
+          predicates:
+            - Path=/api/transacciones/db/{segment}
+          filters:
+            - SetPath=/api/db/{segment}
+
+        - id: transacciones-api
+          uri: lb://ms-transacciones
+          predicates:
+            - Path=/api/transacciones/**
+
+eureka:
+  client:
+    service-url:
+      defaultZone: ${EUREKA_URI:http://eureka-server:8761/eureka/}
+    registry-fetch-interval-seconds: 5
+  instance:
+    prefer-ip-address: true
+    instance-id: ${spring.application.name}:${INSTANCE_ID:${random.value}}:${server.port}
+    lease-renewal-interval-in-seconds: 5
+    lease-expiration-duration-in-seconds: 12
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,gateway
