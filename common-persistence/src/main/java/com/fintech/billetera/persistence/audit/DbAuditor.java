@@ -12,7 +12,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 public class DbAuditor {
 
     private static final String AUDIT_SQL =
-            "SELECT COALESCE(inet_server_addr()::text, '127.0.0.1') AS server_ip, "
+            "SELECT COALESCE(host(inet_server_addr()), '127.0.0.1') AS server_ip, "
                     + "inet_server_port() AS server_port, "
                     + "pg_is_in_recovery() AS in_recovery";
 
