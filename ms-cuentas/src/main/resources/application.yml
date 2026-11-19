@@ -1,0 +1,71 @@
+server:
+  port: ${SERVER_PORT:8081}
+
+spring:
+  application:
+    name: ms-cuentas
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        default_schema: cuentas_db
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    schemas: cuentas_db
+    default-schema: cuentas_db
+    table: flyway_schema_history
+    baseline-on-migrate: false
+    validate-on-migrate: true
+
+app:
+  instance-id: "${INSTANCE_ID:${spring.application.name}}:${server.port}"
+  db:
+    health-check-interval-ms: 3000
+    recovery-success-threshold: 2
+    probe-query-timeout-seconds: 2
+    primary:
+      url: ${DB_PRIMARY_URL:jdbc:postgresql://localhost:5432/laboratorio}
+      username: ${CUENTAS_DB_USER:cuentas_user}
+      password: ${CUENTAS_DB_PASSWORD:CAMBIAR_PASSWORD_CUENTAS}
+      maximum-pool-size: 10
+      minimum-idle: 2
+      connection-timeout-ms: 5000
+      validation-timeout-ms: 2000
+    replicas:
+      - key: REPLICA_1
+        url: ${DB_REPLICA1_URL:jdbc:postgresql://localhost:5433/laboratorio}
+        username: ${CUENTAS_DB_USER:cuentas_user}
+        password: ${CUENTAS_DB_PASSWORD:CAMBIAR_PASSWORD_CUENTAS}
+      - key: REPLICA_2
+        url: ${DB_REPLICA2_URL:jdbc:postgresql://localhost:5434/laboratorio}
+        username: ${CUENTAS_DB_USER:cuentas_user}
+        password: ${CUENTAS_DB_PASSWORD:CAMBIAR_PASSWORD_CUENTAS}
+
+eureka:
+  client:
+    enabled: ${EUREKA_ENABLED:true}
+    service-url:
+      defaultZone: ${EUREKA_URI:http://localhost:8761/eureka/}
+    registry-fetch-interval-seconds: 5
+  instance:
+    prefer-ip-address: true
+    instance-id: ${app.instance-id}
+    lease-renewal-interval-in-seconds: 5
+    lease-expiration-duration-in-seconds: 12
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: always
+
+logging:
+  level:
+    com.fintech.billetera: INFO
