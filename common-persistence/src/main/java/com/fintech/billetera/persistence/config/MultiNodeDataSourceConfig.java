@@ -90,6 +90,10 @@ public class MultiNodeDataSourceConfig {
         hikari.setValidationTimeout(cfg.getValidationTimeoutMs());
         hikari.setReadOnly(readOnly);
         hikari.setPoolName(poolName);
+        if (readOnly) {
+            // No bloquear el arranque del servicio si una replica esta caida (RNF-03).
+            hikari.setInitializationFailTimeout(-1);
+        }
         return new HikariDataSource(hikari);
     }
 
