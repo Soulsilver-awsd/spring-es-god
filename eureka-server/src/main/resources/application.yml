@@ -12,6 +12,8 @@ eureka:
   server:
     enable-self-preservation: false
     eviction-interval-timer-in-ms: 3000
+    # Sin la cache de solo lectura (refresco cada 30 s) las altas y bajas se publican al instante (P03).
+    use-read-only-response-cache: false
 
 management:
   endpoints:

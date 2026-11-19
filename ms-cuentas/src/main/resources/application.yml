@@ -65,6 +65,10 @@ management:
   endpoint:
     health:
       show-details: always
+  health:
+    db:
+      # La caida de una replica no debe marcar el servicio DOWN (RNF-03, P06): el routing ya hace failover.
+      ignore-routing-data-sources: true
 
 logging:
   level:

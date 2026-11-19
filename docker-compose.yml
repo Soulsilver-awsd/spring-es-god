@@ -1,3 +1,35 @@
+x-java-service: &java-service
+  restart: on-failure
+  # Limite por contenedor: la JVM dimensiona el heap sobre este valor (MaxRAMPercentage).
+  mem_limit: 640m
+  networks:
+    - wallet-net
+  environment: &java-env
+    JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75 -Xss512k"
+    EUREKA_URI: http://eureka-server:8761/eureka/
+
+x-java-healthcheck: &java-healthcheck
+  interval: 5s
+  timeout: 3s
+  retries: 30
+  start_period: 40s
+
+x-db-urls: &db-urls
+  DB_PRIMARY_URL: jdbc:postgresql://primary:5432/${POSTGRES_DB:?Define POSTGRES_DB en .env}
+  DB_REPLICA1_URL: jdbc:postgresql://replica1:5432/${POSTGRES_DB:?Define POSTGRES_DB en .env}
+  DB_REPLICA2_URL: jdbc:postgresql://replica2:5432/${POSTGRES_DB:?Define POSTGRES_DB en .env}
+
+x-cuentas-env: &cuentas-env
+  <<: [*java-env, *db-urls]
+  CUENTAS_DB_USER: ${CUENTAS_DB_USER:?Define CUENTAS_DB_USER en .env}
+  CUENTAS_DB_PASSWORD: ${CUENTAS_DB_PASSWORD:?Define CUENTAS_DB_PASSWORD en .env}
+
+x-depends-db-eureka: &depends-db-eureka
+  primary:
+    condition: service_healthy
+  eureka-server:
+    condition: service_healthy
+
 services:
   primary:
     image: postgres:17
@@ -79,6 +111,93 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+
+  eureka-server:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: eureka-server/Dockerfile
+    image: billetera/eureka-server:latest
+    container_name: eureka-server
+    ports:
+      - "8761:8761"
+    healthcheck:
+      <<: *java-healthcheck
+      test: ["CMD-SHELL", "curl -sf http://localhost:8761/actuator/health || exit 1"]
+
+  ms-cuentas-1:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: ms-cuentas/Dockerfile
+    image: billetera/ms-cuentas:latest
+    container_name: ms-cuentas-1
+    environment:
+      <<: *cuentas-env
+      SERVER_PORT: "8081"
+      INSTANCE_ID: ms-cuentas-1
+    ports:
+      - "8081:8081"
+    depends_on: *depends-db-eureka
+    healthcheck:
+      <<: *java-healthcheck
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/actuator/health || exit 1"]
+
+  ms-cuentas-2:
+    <<: *java-service
+    image: billetera/ms-cuentas:latest
+    # Reutiliza la imagen construida por ms-cuentas-1 (un solo build); nunca intentar descargarla.
+    pull_policy: never
+    container_name: ms-cuentas-2
+    environment:
+      <<: *cuentas-env
+      SERVER_PORT: "8082"
+      INSTANCE_ID: ms-cuentas-2
+    ports:
+      - "8082:8082"
+    depends_on:
+      <<: *depends-db-eureka
+      ms-cuentas-1:
+        condition: service_started
+    healthcheck:
+      <<: *java-healthcheck
+      test: ["CMD-SHELL", "curl -sf http://localhost:8082/actuator/health || exit 1"]
+
+  ms-transacciones:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: ms-transacciones/Dockerfile
+    image: billetera/ms-transacciones:latest
+    container_name: ms-transacciones
+    environment:
+      <<: [*java-env, *db-urls]
+      SERVER_PORT: "8083"
+      TX_DB_USER: ${TX_DB_USER:?Define TX_DB_USER en .env}
+      TX_DB_PASSWORD: ${TX_DB_PASSWORD:?Define TX_DB_PASSWORD en .env}
+    ports:
+      - "8083:8083"
+    depends_on: *depends-db-eureka
+    healthcheck:
+      <<: *java-healthcheck
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/actuator/health || exit 1"]
+
+  api-gateway:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: api-gateway/Dockerfile
+    image: billetera/api-gateway:latest
+    container_name: api-gateway
+    environment: *java-env
+    ports:
+      - "8080:8080"
+    depends_on:
+      eureka-server:
+        condition: service_healthy
+    healthcheck:
+      <<: *java-healthcheck
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/actuator/health || exit 1"]
 
 networks:
   wallet-net:

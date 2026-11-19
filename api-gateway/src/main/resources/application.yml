@@ -9,6 +9,18 @@ spring:
       cache:
         ttl: 3s
     gateway:
+      httpclient:
+        # Fallo rapido ante una instancia caida que Eureka aun no ha retirado (P03).
+        connect-timeout: 2000
+      default-filters:
+        # Solo GET (idempotente) y solo errores de conexion: el reintento vuelve a pasar por el
+        # balanceador y elige otra instancia. Nunca se reintentan POST ni respuestas 5xx del servicio.
+        - name: Retry
+          args:
+            retries: 2
+            methods: GET
+            series: ""
+            exceptions: java.net.ConnectException
       discovery:
         locator:
           enabled: false
