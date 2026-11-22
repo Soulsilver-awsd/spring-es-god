@@ -49,9 +49,13 @@ Reiniciar desde cero (borra los volúmenes y vuelve a aplicar las migraciones y 
 docker compose down -v && docker compose up -d --build
 ```
 
-## Verificación P01–P08
+## Pruebas P01–P08
 
-Los 8 escenarios de [criterios de aceptación](docs/srs/06-verificacion-y-trazabilidad/01-criterios-aceptacion-p01-p08.md) están automatizados solo con `curl`, con aserciones y un resumen final (código de salida `0` si todo pasa):
+El enunciado de los 8 escenarios obligatorios y las evidencias que exige cada uno están en [pruebas obligatorias P01–P08](docs/srs/06-verificacion-y-trazabilidad/03-pruebas-obligatorias-p01-p08.md). Los [criterios de aceptación P01–P08](docs/srs/06-verificacion-y-trazabilidad/01-criterios-aceptacion-p01-p08.md) los detallan con precondiciones, procedimiento y criterio verificable. Se pueden ejecutar de dos formas: con el script automatizado o paso a paso.
+
+### Ejecución automatizada
+
+Los scripts usan solo `curl` y `docker compose`, comprueban cada criterio y terminan con un resumen (código de salida `0` si todo pasa):
 
 ```bash
 ./docs/api/curl-p01-p08.sh            # Linux / macOS / WSL
@@ -63,367 +67,231 @@ Los 8 escenarios de [criterios de aceptación](docs/srs/06-verificacion-y-trazab
 .\docs\api\curl-p01-p08.ps1 P03 P06
 ```
 
-| Prueba | Qué hace el script | Criterio |
-|---|---|---|
-| `P01` | `GET :8761/eureka/apps` + lecturas vía `:8080` | `MS-CUENTAS` 2 `UP`, `MS-TRANSACCIONES` 1 `UP`, `200` vía Gateway |
-| `P02` | 120 × `GET /api/cuentas/instancia` contando `X-Service-Instance` | 120/120 `200`, reparto ~60/60 |
-| `P03` | Tráfico continuo + `docker compose stop ms-cuentas-2` y luego `start` | Convergencia a `ms-cuentas-1` y reincorporación de `ms-cuentas-2` |
-| `P04` | Transferencia de `25.00` + intento de `9999.00` | `201` con `instanciaCuentasConsultada`; `409` sin alterar saldos |
-| `P05` | Escritura + 20 lecturas ordinarias + `/api/cuentas/db/estado` | Escritura en `PRIMARY`; lecturas repartidas `REPLICA_1`/`REPLICA_2` |
-| `P06` | `docker compose stop replica1` + 20 lecturas | 0 errores HTTP; `REPLICA_1 available=false` |
-| `P07` | Transferencia + `saldo-critico` + `comprobante/{codigo}` inmediatos | `LECTURA_CRITICA_PRIMARIO`, `recovery=false`, saldo exacto |
-| `P08` | `docker compose start replica1` + sondeo de `/db/estado` + 20 lecturas | `available=true` tras 2/2 sondeos y vuelta al *Round-Robin* |
+`P03`, `P06` y `P08` detienen y arrancan contenedores, y los dejan en su estado inicial. `P04`, `P05`, `P07` y `P08` hacen transferencias reales: tras unas 6 ejecuciones completas se agota el límite diario de `0991112233` (`300.00`) y hay que reiniciar con `docker compose down -v && docker compose up -d --build`.
 
-`P03`, `P06` y `P08` detienen y arrancan contenedores y los dejan en su estado inicial. `P04`, `P05`, `P07` y `P08` hacen transferencias reales: tras unas 6 ejecuciones completas se agota el límite diario de `0991112233` (`300.00`) y hay que reiniciar con `docker compose down -v`.
+La salida de una ejecución completa (31 OK, 0 FALLAS) está en [docs/api/evidencia-p01-p08.md](docs/api/evidencia-p01-p08.md).
 
-La evidencia de una ejecución completa está en [docs/api/evidencia-p01-p08.md](docs/api/evidencia-p01-p08.md).
+### Resumen
 
-## Anexo · Laboratorio de replicación PostgreSQL
+| Prueba | Escenario | Requisitos | Criterio de aceptación |
+|---|---|---|---|
+| `P01` | Descubrimiento dinámico | `RF-10`, `RF-11` | `MS-CUENTAS` con 2 instancias `UP` (`8081`, `8082`), `MS-TRANSACCIONES` con 1 (`8083`); `200` vía `:8080` sin rutas fijas |
+| `P02` | Balanceo HTTP | `RF-11`, `RNF-01` | 100/100 `200`; reparto aprox. 50/50 entre `ms-cuentas-1` y `ms-cuentas-2`, nunca 100/0 |
+| `P03` | Fallo de instancia | `RF-10`, `RNF-02` | Tras la ventana de detección atiende solo `ms-cuentas-1`; al reiniciar, `ms-cuentas-2` vuelve a Eureka y al balanceo |
+| `P04` | Comunicación entre servicios | `RF-04`, `RF-06`, `RF-12` | `201` con `instanciaCuentasConsultada`, origen descontado y destino acreditado; error `400`/`409` sin alterar saldos |
+| `P05` | Enrutamiento de base de datos | `RF-01`, `RF-02`, `RF-07`, `RNF-05`, `RNF-07` | Escritura en `PRIMARY` (`recovery=false`); lecturas con `recovery=true` repartidas entre `REPLICA_1` y `REPLICA_2` |
+| `P06` | Fallo de réplica PostgreSQL | `RNF-03` | 0 fallos al cliente usando `REPLICA_2`; `REPLICA_1 available=false`, `REPLICA_2 available=true` |
+| `P07` | Consistencia de lectura | `RF-03`, `RF-08`, `RNF-06` | Saldo descontado y comprobante visibles de inmediato, con `recovery=false` y `LECTURA_CRITICA_PRIMARIO` |
+| `P08` | Recuperación de réplica | `RNF-04`, `RNF-08` | `replica1` en `streaming`, 2/2 sondeos `pg_is_in_recovery() = true` y vuelta al *Round-Robin* |
 
-### 1. Objetivo
+### Procedimiento manual
 
-Validar el funcionamiento de una infraestructura PostgreSQL compuesta por un nodo primario y dos réplicas de lectura, desplegados mediante Docker Compose.
+Todas las peticiones pasan por el Gateway (`:8080`). Las respuestas incluyen las cabeceras `X-Service-Instance` (instancia que atendió), `X-Db-Node` (nodo PostgreSQL usado) y `X-Db-Fallback` (failover de réplica), además del bloque `auditoriaTecnica` del cuerpo. Las consultas `psql` usan las variables `POSTGRES_USER` y `POSTGRES_DB` del propio contenedor, así que no hace falta escribir credenciales.
 
-Las pruebas permiten verificar:
+Cuentas semilla usadas: origen `0991112233` y destino `0984445566`.
 
-- El estado de los nodos.
-- La replicación de datos mediante WAL.
-- La separación de operaciones de lectura y escritura.
-- La continuidad del servicio ante la caída de una réplica.
-- La recuperación y sincronización de una réplica después de reiniciarse.
+#### `P01` · Descubrimiento dinámico
 
-### 2. Requisitos previos
-
-Tener Docker y Docker Compose instalados.
-
-Ejecutar todos los comandos desde el directorio que contiene `docker-compose.yml`.
-
-Iniciar los contenedores:
-
-```bash
-docker compose up -d
-```
-
-Verificar su estado:
+**Precondiciones:** los 8 contenedores levantados y `healthy`.
 
 ```bash
 docker compose ps
+curl -s -H 'Accept: application/json' http://localhost:8761/eureka/apps \
+  | jq -r '.applications.application[] | "\(.name): \([.instance[] | "\(.instanceId) \(.status)"] | join(", "))"'
+curl -i http://localhost:8080/api/cuentas/0991112233
+curl -i http://localhost:8080/api/transacciones/historial/0991112233
 ```
 
-Deben aparecer los servicios `primary`, `replica1` y `replica2`.
+**Criterios de aceptación:**
 
-> Los comandos utilizan el usuario `admin` y la base de datos `laboratorio`, definidos en el ejemplo. Adaptarlos si se modifica la configuración.
+- `MS-CUENTAS` registrado con 2 instancias `UP` (`8081` y `8082`).
+- `MS-TRANSACCIONES` registrado con 1 instancia `UP` (`8083`).
+- Las dos peticiones vía Gateway responden `200 OK`.
 
-### 3. Prueba 1: identificar el rol de cada nodo
+#### `P02` · Balanceo HTTP
 
-#### Nodo primario
+**Precondiciones:** `ms-cuentas-1` y `ms-cuentas-2` en `UP` en Eureka.
 
 ```bash
-docker compose exec primary \
-  psql -U admin -d laboratorio \
-  -c "SELECT pg_is_in_recovery();"
+for i in $(seq 100); do
+  curl -s -o /dev/null -w '%{http_code} %header{X-Service-Instance}\n' http://localhost:8080/api/cuentas/instancia
+done | sort | uniq -c
 ```
 
-**Resultado esperado:** `false` (`f`).
+**Criterios de aceptación:**
 
-Esto significa que PostgreSQL no se encuentra en modo de recuperación y funciona como primario.
+- 100/100 respuestas `200`.
+- Reparto equilibrado entre `ms-cuentas-1:8081` y `ms-cuentas-2:8082` (aprox. 50/50, nunca 100/0).
 
-#### Réplica 1
+#### `P03` · Fallo de instancia
+
+**Precondiciones:** tráfico periódico activo contra el Gateway.
+
+1. En una terminal, dejar tráfico continuo y observar que responden las dos instancias:
+
+   ```bash
+   while true; do
+     printf '%s ' "$(date +%T)"
+     curl -s -o /dev/null --max-time 5 -w '%{http_code} %header{X-Service-Instance}\n' \
+       http://localhost:8080/api/cuentas/0991112233
+     sleep 0.2
+   done
+   ```
+
+2. En otra terminal, detener una instancia durante la ráfaga:
+
+   ```bash
+   docker compose stop ms-cuentas-2
+   ```
+
+3. Medir los errores transitorios y el tiempo hasta que solo responde `ms-cuentas-1`.
+4. Reiniciar la instancia y medir el tiempo hasta que vuelve a recibir tráfico:
+
+   ```bash
+   docker compose start ms-cuentas-2
+   ```
+
+**Criterios de aceptación:**
+
+- Tras la ventana de detección, el sistema sigue atendiendo mediante `ms-cuentas-1`.
+- Al reiniciar, `ms-cuentas-2` vuelve a registrarse en Eureka y reanuda su participación en el balanceo.
+
+Con `use-read-only-response-cache: false` en Eureka y el reintento de `GET` ante errores de conexión en el Gateway, la convergencia es inmediata y no hay errores visibles para el cliente.
+
+#### `P04` · Comunicación entre servicios
+
+**Precondiciones:** cuentas `0991112233` y `0984445566` activas en `cuentas_db`.
 
 ```bash
-docker compose exec replica1 \
-  psql -U admin -d laboratorio \
-  -c "SELECT pg_is_in_recovery();"
+curl -s http://localhost:8080/api/cuentas/0991112233/saldo-critico | jq '.datos.saldo'
+curl -s http://localhost:8080/api/cuentas/0984445566/saldo-critico | jq '.datos.saldo'
+
+# Caso exitoso
+curl -i -X POST http://localhost:8080/api/transacciones/transferir \
+  -H 'Content-Type: application/json' \
+  -d '{"celularOrigen":"0991112233","celularDestino":"0984445566","monto":25.00,"motivo":"Prueba P04"}'
+
+# Error controlado: monto mayor al saldo disponible
+curl -i -X POST http://localhost:8080/api/transacciones/transferir \
+  -H 'Content-Type: application/json' \
+  -d '{"celularOrigen":"0991112233","celularDestino":"0984445566","monto":9999.00,"motivo":"Saldo insuficiente"}'
 ```
 
-**Resultado esperado:** `true` (`t`).
+Volver a consultar los saldos después de cada transferencia.
 
-#### Réplica 2
+**Criterios de aceptación:**
+
+- Caso exitoso: `201 Created`, origen descontado, destino acreditado, transacción persistida en `tx_db.transacciones` y `auditoriaTecnica.instanciaCuentasConsultada` presente.
+- Caso de error: `400` o `409` controlado sin alterar los saldos.
+
+#### `P05` · Enrutamiento de base de datos
+
+**Precondiciones:** `primary`, `replica1` y `replica2` sanos y 2 réplicas en `streaming`:
 
 ```bash
-docker compose exec replica2 \
-  psql -U admin -d laboratorio \
-  -c "SELECT pg_is_in_recovery();"
+docker compose exec primary sh -c \
+  'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT application_name, client_addr, state FROM pg_stat_replication"'
 ```
 
-**Resultado esperado:** `true` (`t`).
+1. Ejecutar una transferencia (como en `P04`) y revisar `auditoriaTecnica.nodoBaseDatos`.
+2. Ejecutar 20 consultas ordinarias y contar el nodo usado:
 
-Ambas instancias funcionan como servidores standby.
+   ```bash
+   for i in $(seq 10); do
+     for url in cuentas/0991112233/contactos transacciones/historial/0991112233; do
+       curl -s -o /dev/null -w '%{http_code} %header{X-Db-Node}\n' "http://localhost:8080/api/$url"
+     done
+   done | sort | uniq -c
+   curl -s http://localhost:8080/api/cuentas/0991112233/contactos | jq '.auditoriaTecnica'
+   ```
 
-### 4. Prueba 2: verificar el streaming WAL
+3. Consultar el estado del enrutamiento y los logs:
 
-Ejecutar en el primario:
+   ```bash
+   curl -s http://localhost:8080/api/cuentas/db/estado | jq
+   docker compose logs --tail=30 ms-cuentas-1
+   ```
 
-```bash
-docker compose exec primary \
-  psql -U admin -d laboratorio \
-  -c "SELECT application_name,
-             client_addr,
-             state,
-             sync_state,
-             sent_lsn,
-             replay_lsn
-      FROM pg_stat_replication;"
-```
+**Criterios de aceptación:**
 
-**Resultado esperado:**
+- La escritura muestra `nodoBaseDatos` en `PRIMARY` con `recovery=false`.
+- Las lecturas ordinarias muestran `recovery=true` y se reparten entre `REPLICA_1` y `REPLICA_2`, cada una con su IP (`inet_server_addr()`).
 
-- Dos conexiones correspondientes a las réplicas.
-- `state = streaming`.
-- `sync_state = async` en la configuración propuesta.
-- Valores LSN que representan posiciones del registro WAL.
+#### `P06` · Fallo de réplica PostgreSQL
 
-#### Interpretación
-
-`sent_lsn` indica hasta qué posición WAL ha enviado el primario.
-
-`replay_lsn` indica hasta qué posición la réplica ha reproducido los cambios, según la información reportada al primario.
-
-Una diferencia entre estas posiciones puede indicar retraso de replicación.
-
-### 5. Prueba 3: crear información en el primario
-
-Crear una tabla:
-
-```bash
-docker compose exec primary \
-  psql -U admin -d laboratorio \
-  -c "CREATE TABLE IF NOT EXISTS prueba_replica (
-        id BIGSERIAL PRIMARY KEY,
-        mensaje TEXT NOT NULL,
-        fecha TIMESTAMPTZ DEFAULT NOW()
-      );"
-```
-
-Insertar un registro:
-
-```bash
-docker compose exec primary \
-  psql -U admin -d laboratorio \
-  -c "INSERT INTO prueba_replica (mensaje)
-      VALUES ('Hola desde el nodo primario');"
-```
-
-Consultar el primario:
-
-```bash
-docker compose exec primary \
-  psql -U admin -d laboratorio \
-  -c "SELECT * FROM prueba_replica;"
-```
-
-**Resultado esperado:** aparece el registro insertado.
-
-### 6. Prueba 4: verificar datos en las réplicas
-
-Consultar la réplica 1:
-
-```bash
-docker compose exec replica1 \
-  psql -U admin -d laboratorio \
-  -c "SELECT * FROM prueba_replica;"
-```
-
-Consultar la réplica 2:
-
-```bash
-docker compose exec replica2 \
-  psql -U admin -d laboratorio \
-  -c "SELECT * FROM prueba_replica;"
-```
-
-**Resultado esperado:** ambas réplicas muestran el registro creado en el primario una vez reproducidos los WAL.
-
-Esto demuestra que los cambios se propagan desde el primario hacia los nodos secundarios.
-
-> La replicación es asíncrona. Si una consulta se realiza inmediatamente después de una escritura, podría existir un retraso temporal.
-
-### 7. Prueba 5: impedir escrituras en una réplica
-
-Intentar insertar directamente en `replica1`:
-
-```bash
-docker compose exec replica1 \
-  psql -U admin -d laboratorio \
-  -c "INSERT INTO prueba_replica (mensaje)
-      VALUES ('Escritura no permitida');"
-```
-
-**Resultado esperado:**
-
-```text
-ERROR: cannot execute INSERT in a read-only transaction
-```
-
-El error es el comportamiento correcto.
-
-Las réplicas físicas en modo standby no permiten modificar directamente los datos.
-
-### 8. Prueba 6: simular la caída de una réplica
-
-Detener `replica1`:
+**Precondiciones:** ambas réplicas sanas y atendiendo lecturas.
 
 ```bash
 docker compose stop replica1
+
+for i in $(seq 10); do
+  for url in cuentas/0991112233/contactos transacciones/historial/0991112233; do
+    curl -s -o /dev/null -w '%{http_code} %header{X-Db-Node} fallback=%header{X-Db-Fallback}\n' \
+      "http://localhost:8080/api/$url"
+  done
+done | sort | uniq -c
+
+curl -s http://localhost:8080/api/cuentas/db/estado | jq '.replicas'
+curl -s http://localhost:8080/api/transacciones/db/estado | jq '.replicas'
+docker compose logs --tail=20 ms-cuentas-1 | grep ReplicaHealthTracker
 ```
 
-Verificar el estado:
+**Criterios de aceptación:**
+
+- Las consultas siguen respondiendo `200 OK` usando `REPLICA_2` (0 fallos al cliente). Las primeras pueden traer `X-Db-Fallback: true` mientras la sonda de 3 s detecta la caída.
+- `/api/cuentas/db/estado` muestra `REPLICA_1` con `available=false` y `REPLICA_2` con `available=true`.
+
+Cada instancia de `ms-cuentas` tiene su propio `ReplicaHealthTracker`; repetir la consulta de estado para ver las dos.
+
+#### `P07` · Consistencia de lectura (*read-your-own-writes*)
+
+**Precondiciones:** cuenta origen con saldo conocido.
 
 ```bash
-docker compose ps
+CODIGO=$(curl -s -X POST http://localhost:8080/api/transacciones/transferir \
+  -H 'Content-Type: application/json' \
+  -d '{"celularOrigen":"0991112233","celularDestino":"0984445566","monto":25.00,"motivo":"Prueba P07"}' \
+  | jq -r '.datos.codigoComprobante')
+
+# Inmediatamente después, en peticiones secuenciales:
+curl -s http://localhost:8080/api/cuentas/0991112233/saldo-critico | jq '{saldo: .datos.saldo, auditoria: .auditoriaTecnica}'
+curl -s "http://localhost:8080/api/transacciones/comprobante/$CODIGO" | jq '{codigo: .datos.codigoComprobante, auditoria: .auditoriaTecnica}'
+
+# Opcional: lectura ordinaria forzada al primario
+curl -i -H 'X-Consistencia: CRITICA' http://localhost:8080/api/cuentas/0991112233
 ```
 
-Comprobar que el primario continúa funcionando:
+**Criterios de aceptación:**
 
-```bash
-docker compose exec primary \
-  psql -U admin -d laboratorio \
-  -c "SELECT COUNT(*) FROM prueba_replica;"
-```
+- El saldo aparece ya descontado y el comprobante recién creado es visible sin esperar la propagación asíncrona.
+- `auditoriaTecnica` confirma `recovery=false` (`PRIMARY`) y `politicaEnrutamiento = LECTURA_CRITICA_PRIMARIO`.
 
-Comprobar que la segunda réplica sigue disponible:
+#### `P08` · Recuperación de réplica
 
-```bash
-docker compose exec replica2 \
-  psql -U admin -d laboratorio \
-  -c "SELECT COUNT(*) FROM prueba_replica;"
-```
-
-**Resultado esperado:** el primario y `replica2` continúan atendiendo sus consultas.
-
-### 9. Prueba 7: generar cambios mientras una réplica está detenida
-
-Con `replica1` detenida, insertar 100 registros:
-
-```bash
-docker compose exec primary \
-  psql -U admin -d laboratorio \
-  -c "INSERT INTO prueba_replica (mensaje)
-      SELECT 'Registro de recuperación ' || g
-      FROM generate_series(1,100) AS g;"
-```
-
-Consultar el número de registros de la prueba:
-
-```bash
-docker compose exec primary \
-  psql -U admin -d laboratorio \
-  -c "SELECT COUNT(*)
-      FROM prueba_replica
-      WHERE mensaje LIKE 'Registro de recuperación %';"
-```
-
-**Resultado esperado:** 100 registros nuevos, siempre que la prueba se ejecute una sola vez.
-
-Verificar que `replica2` recibió los cambios:
-
-```bash
-docker compose exec replica2 \
-  psql -U admin -d laboratorio \
-  -c "SELECT COUNT(*)
-      FROM prueba_replica
-      WHERE mensaje LIKE 'Registro de recuperación %';"
-```
-
-Si la réplica ya está sincronizada, también devolverá 100.
-
-### 10. Prueba 8: recuperar la réplica detenida
-
-Reiniciar el servicio:
+**Precondiciones:** `replica1` detenida tras `P06` y con escrituras nuevas generadas mientras estuvo caída (por ejemplo, la transferencia de `P07`).
 
 ```bash
 docker compose start replica1
+
+docker compose exec primary sh -c \
+  'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT application_name, state, sent_lsn, replay_lsn FROM pg_stat_replication"'
+
+# Repetir hasta ver 2 sondeos exitosos y available=true
+curl -s http://localhost:8080/api/cuentas/db/estado | jq '.replicas[] | {nodo, available, consecutiveSuccesses, lastReplayLsn}'
 ```
 
-Consultar sus logs:
+Después, repetir las 20 lecturas ordinarias de `P05` y comprobar que `REPLICA_1` vuelve a aparecer y a incrementar su contador en `consultasTotales`.
+
+**Criterios de aceptación:**
+
+- `replica1` sincroniza los WAL pendientes (`state = streaming`, `replay_lsn` igual a `sent_lsn`).
+- Supera los 2 chequeos `pg_is_in_recovery() = true` y vuelve a participar en el *Round-Robin*.
+
+La recuperación depende de que los WAL necesarios sigan disponibles en el primario. `wal_keep_size` fija una retención mínima, pero no la garantiza indefinidamente; en producción se usarían *replication slots* y archivado de WAL.
+
+### Limpieza
 
 ```bash
-docker compose logs --tail=50 replica1
+docker compose down      # detiene los contenedores y conserva los datos
+docker compose down -v   # borra también los volúmenes (migraciones y datos semilla se reaplican al levantar)
 ```
-
-Esperar hasta que PostgreSQL acepte conexiones de lectura.
-
-Verificar los registros:
-
-```bash
-docker compose exec replica1 \
-  psql -U admin -d laboratorio \
-  -c "SELECT COUNT(*)
-      FROM prueba_replica
-      WHERE mensaje LIKE 'Registro de recuperación %';"
-```
-
-**Resultado esperado:** 100 registros.
-
-La réplica recuperó los cambios generados mientras estuvo detenida.
-
-#### Advertencia técnica
-
-La recuperación depende de que los WAL necesarios sigan disponibles.
-
-El parámetro `wal_keep_size` establece una retención mínima, pero no garantiza conservar indefinidamente todos los registros WAL.
-
-En sistemas de producción pueden utilizarse slots de replicación y archivado WAL, junto con mecanismos de monitoreo y control del almacenamiento.
-
-### 11. Prueba 9: comprobar el estado final de replicación
-
-Ejecutar nuevamente:
-
-```bash
-docker compose exec primary \
-  psql -U admin -d laboratorio \
-  -c "SELECT application_name,
-             state,
-             sync_state,
-             sent_lsn,
-             replay_lsn
-      FROM pg_stat_replication;"
-```
-
-**Resultado esperado:** las dos réplicas vuelven a aparecer con `state = streaming`.
-
-Para confirmar que están al día, comparar sus posiciones de reproducción con la posición WAL del primario y comprobar los registros de prueba.
-
-### 12. Preguntas para el análisis técnico
-
-1. ¿Cuál es la diferencia entre un nodo primario y una réplica?
-2. ¿Qué función cumple el WAL?
-3. ¿Qué significa `pg_is_in_recovery()`?
-4. ¿Por qué no podemos insertar registros directamente en una réplica física?
-5. ¿Qué ocurre con las escrituras cuando una réplica deja de funcionar?
-6. ¿Qué sucede cuando el primario deja de funcionar?
-7. ¿Qué diferencia existe entre replicación y alta disponibilidad?
-8. ¿Qué riesgos introduce la replicación asíncrona?
-9. ¿Por qué es importante conservar los WAL durante una interrupción?
-10. ¿Cómo podría una aplicación distribuir consultas entre varias réplicas?
-
-### 13. Evidencias de funcionamiento
-
-El informe técnico debe incluir:
-
-- Captura o salida de `docker compose ps`.
-- Identificación del primario y de las réplicas.
-- Resultado de `pg_stat_replication`.
-- Inserción de información en el primario.
-- Lectura de la información desde ambas réplicas.
-- Error esperado al intentar escribir en una réplica.
-- Evidencia de la detención de una réplica.
-- Inserción de 100 registros durante la interrupción.
-- Recuperación y sincronización posterior.
-- Explicación técnica de los resultados.
-
-### 14. Limpieza del laboratorio
-
-Para detener los contenedores sin eliminar los volúmenes:
-
-```bash
-docker compose down
-```
-
-Para eliminar los contenedores y los volúmenes asociados:
-
-```bash
-docker compose down -v
-```
-
-**Advertencia:** `down -v` elimina los datos persistidos en los volúmenes Docker del proyecto. Utilizar únicamente cuando se desee reiniciar completamente el laboratorio.

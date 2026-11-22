@@ -2,6 +2,8 @@
 
 Cada escenario experimental obligatorio de la actividad queda especificado con precondiciones, procedimiento de prueba, evidencia verificable y criterio de aceptación.
 
+> **Fuente obligatoria:** el enunciado de las pruebas está en [03-pruebas-obligatorias-p01-p08.md](03-pruebas-obligatorias-p01-p08.md). Ese documento manda: cada escenario debe ejecutarse y documentarse, y no se aceptan capturas de configuración en lugar de una prueba funcional. Este documento lo detalla con precondiciones, procedimiento y criterios verificables, y en cada escenario indica las evidencias que exige el enunciado.
+
 ---
 
 ## `P01` · Descubrimiento Dinámico
@@ -10,6 +12,7 @@ Cada escenario experimental obligatorio de la actividad queda especificado con p
 - **Procedimiento:**
   1. Consultar `GET http://localhost:8761/eureka/apps` (`Accept: application/json`).
   2. Enviar solicitudes funcionales vía Gateway (`GET http://localhost:8080/api/cuentas/0991112233` y `GET http://localhost:8080/api/transacciones/historial/0991112233`).
+- **Evidencias exigidas por el enunciado:** Registro de servicios; identificación de instancias; solicitudes funcionales.
 - **Criterios de aceptación:**
   - `MS-CUENTAS` aparece registrado con `2` instancias `UP` (`8081` y `8082`).
   - `MS-TRANSACCIONES` aparece registrado con `1` instancia `UP` (`8083`).
@@ -23,6 +26,7 @@ Cada escenario experimental obligatorio de la actividad queda especificado con p
 - **Procedimiento:**
   1. Ejecutar un script con `100` o más solicitudes consecutivas `GET http://localhost:8080/api/cuentas/0991112233` (o `/api/cuentas/instancia`).
   2. Contabilizar el valor del encabezado `X-Service-Instance` / `auditoriaTecnica.servicioOrigen` por cada respuesta.
+- **Evidencias exigidas por el enunciado:** Distribución observada; total de respuestas exitosas; errores.
 - **Criterios de aceptación:**
   - `100/100` respuestas exitosas (`HTTP 200`).
   - Distribución equilibrada entre `ms-cuentas-1` y `ms-cuentas-2` (aprox. `50 / 50`, nunca `100 / 0`).
@@ -37,6 +41,7 @@ Cada escenario experimental obligatorio de la actividad queda especificado con p
   2. Ejecutar `docker compose stop ms-cuentas-2` durante la ráfaga.
   3. Medir posibles errores transitorios, tiempo de detección en Gateway/Eureka y continuidad exclusiva sobre `ms-cuentas-1`.
   4. Ejecutar `docker compose start ms-cuentas-2` y medir tiempo hasta que vuelve a recibir tráfico balanceado.
+- **Evidencias exigidas por el enunciado:** Solicitudes antes, durante y después del fallo; tiempo observado de recuperación.
 - **Criterios de aceptación:**
   - El sistema continúa atendiendo peticiones mediante `ms-cuentas-1` tras la ventana de detección.
   - Al reiniciar `ms-cuentas-2`, vuelve a registrarse en Eureka y reanuda participación en el balanceo.
@@ -49,6 +54,7 @@ Cada escenario experimental obligatorio de la actividad queda especificado con p
 - **Procedimiento:**
   1. Caso exitoso: `POST http://localhost:8080/api/transacciones/transferir` con monto válido (`$25.00`).
   2. Caso de error controlado: repetir con monto mayor al saldo disponible o límite diario.
+- **Evidencias exigidas por el enunciado:** Trazas de solicitud y respuesta; resultado funcional; manejo de errores.
 - **Criterios de aceptación:**
   - Caso exitoso retorna `201 Created`, descuenta origen, acredita destino, persiste en `tx_db.transacciones` y evidencia `instanciaCuentasConsultada` en `auditoriaTecnica`.
   - Caso de error retorna `400`/`409` controlado sin alterar saldos.
@@ -62,6 +68,7 @@ Cada escenario experimental obligatorio de la actividad queda especificado con p
   1. Ejecutar una transferencia (`POST /api/transacciones/transferir`).
   2. Ejecutar `20` consultas ordinarias (`GET /api/cuentas/0991112233/contactos` y `GET /api/transacciones/historial/0991112233`).
   3. Consultar `GET http://localhost:8080/api/cuentas/db/estado` y logs de aplicación.
+- **Evidencias exigidas por el enunciado:** Identificación del nodo utilizado; consultas SQL; registros de aplicación.
 - **Criterios de aceptación:**
   - La escritura muestra `nodoBaseDatos` apuntando a `primary` (`recovery=false`).
   - Las lecturas ordinarias muestran `recovery=true` y reparto equilibrado entre `REPLICA_1` y `REPLICA_2` con sus respectivas IPs (`inet_server_addr()`).
@@ -75,6 +82,7 @@ Cada escenario experimental obligatorio de la actividad queda especificado con p
   1. Ejecutar `docker compose stop replica1`.
   2. Lanzar inmediatamente una serie de consultas `GET /api/cuentas/0991112233/contactos` y `GET /api/transacciones/historial/0991112233`.
   3. Consultar `GET http://localhost:8080/api/cuentas/db/estado` y logs de `ReplicaHealthTracker`.
+- **Evidencias exigidas por el enunciado:** Estado de contenedores; resultados de consultas; registros del mecanismo de selección.
 - **Criterios de aceptación:**
   - Las consultas continúan respondiendo `HTTP 200 OK` usando `REPLICA_2` (`0` fallos al cliente).
   - `/api/cuentas/db/estado` muestra `REPLICA_1` con `available=false` y `REPLICA_2` con `available=true`.
@@ -88,6 +96,7 @@ Cada escenario experimental obligatorio de la actividad queda especificado con p
   1. Ejecutar `POST /api/transacciones/transferir` descontando `$25.00`.
   2. De forma inmediata (siguiente petición secuencial), consultar `GET /api/cuentas/{origen}/saldo-critico` y `GET /api/transacciones/comprobante/{codigo}`.
   3. Opcionalmente probar `GET /api/cuentas/{origen}` con header `X-Consistencia: CRITICA`.
+- **Evidencias exigidas por el enunciado:** Secuencia de solicitudes; resultado; justificación de la política aplicada.
 - **Criterios de aceptación:**
   - Las lecturas críticas muestran el saldo descontado y el comprobante recién creado sin esperar propagación asíncrona.
   - `auditoriaTecnica` confirma `recovery=false` (`PRIMARY`) y `politicaEnrutamiento = LECTURA_CRITICA_PRIMARIO`.
@@ -102,5 +111,6 @@ Cada escenario experimental obligatorio de la actividad queda especificado con p
   2. Verificar en el Primario `SELECT application_name, state, sent_lsn, replay_lsn FROM pg_stat_replication;`.
   3. Consultar `GET http://localhost:8080/api/cuentas/db/estado` hasta observar 2 sondeos exitosos y `available=true`.
   4. Ejecutar nuevas consultas ordinarias y verificar que `REPLICA_1` vuelve a incrementar su contador `queriesServed`.
+- **Evidencias exigidas por el enunciado:** Estado de replicación; reincorporación; consultas atendidas.
 - **Criterios de aceptación:**
   - `replica1` sincroniza WAL pendientes (`state = streaming`), supera los 2 chequeos `pg_is_in_recovery() = true` y vuelve a participar en el *Round-Robin*.
