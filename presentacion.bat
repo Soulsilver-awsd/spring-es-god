@@ -55,6 +55,7 @@ $script:BufferingLeft = $false
 $script:LeftRows = New-Object System.Collections.Generic.List[object]
 $script:LeftTitle = "WORKSPACE"
 $script:EventLogs = New-Object System.Collections.Generic.List[object]
+$script:HttpTraces = New-Object System.Collections.Generic.List[object]
 $script:LastLoggedDockSig = ""
 
 $script:LastSnap = $null
@@ -798,6 +799,7 @@ function Parse-ConsoleKey($k) {
         "C" { return "ENV" }
         "W" { return "DOCK_REFRESH" }
         "L" { return "LOG" }
+        "E" { return "EXPORT" }
         "H" { return "HELP" }
         "?" { return "HELP" }
         default {
@@ -844,11 +846,11 @@ function Wait-SlideFooter([string]$NextLabel = "Siguiente", [bool]$AllowBack = $
         Write-CleanLine ("  [ESPACIO/→] {0}" -f $NextLabel) $NextColor
     }
     $helpLine = if ($script:UiW -ge 98) {
-        "  [1-6] Seccion  [R] Actualizar  [M] Inicio  [B] Eureka  [U] Utils  [L] Log  [?] Ayuda  [Q] Salir"
+        "  [1-6] Sec  [R] Act  [M] Inicio  [B] Eureka  [U] Utils  [L] Log  [E] Exportar  [?] Ayuda  [Q] Salir"
     } elseif ($script:UiW -ge 77) {
-        "  [1-6] Sec [R] Act [M] Inicio [B] Eur [U] Util [L] Log [?] Ayuda [Q] Salir"
+        "  [1-6] Sec [R] Act [M] Ini [B] Eur [U] Util [L] Log [E] Rep [?] Ayuda [Q] Salir"
     } else {
-        "  [1-6] Sec [R] Act [M] Ini [B/U] Util [L] Log [?] Ayuda [Q] Sal"
+        "  [1-6] Sec [R] Act [M] Ini [U] Util [L] Log [E] Rep [?] Ayuda [Q] Sal"
     }
     Write-CleanLine $helpLine "DarkGray"
     End-Frame
@@ -880,7 +882,8 @@ function Show-HelpModal {
         Write-BoxLine "R                  : Re-ejecutar en vivo el slide actual" "Yellow" "Cyan"
         Write-BoxLine "M / Esc            : Volver a la Portada principal" "White" "Cyan"
         Write-BoxLine "B / U / W          : Abrir Eureka / Utilidades / Dock" "White" "Cyan"
-        Write-BoxLine "L  |  H / ? / F1   : Ver log completo | Abrir esta ayuda" "Cyan" "Cyan"
+        Write-BoxLine "L  |  E            : Ver log completo | Exportar reporte (.md)" "Cyan" "Cyan"
+        Write-BoxLine "H / ? / F1         : Abrir esta ayuda" "Cyan" "Cyan"
         Write-BoxLine "Q                  : Salir de la presentacion" "DarkGray" "Cyan"
         Write-BoxBottom "Cyan"
         Write-BlankLine
@@ -940,6 +943,221 @@ function Show-LogModal {
     $script:FirstFrame = $true
 }
 
+function Add-HttpTrace([string]$Method, [string]$Url, [string]$ReqBody, [string]$Code, [int]$Ms, [hashtable]$Headers, [string]$RawBody, [string]$Note = "") {
+    if ($script:HttpTraces.Count -ge 200) { $script:HttpTraces.RemoveAt(0) }
+    $hdrCopy = @{}
+    if ($Headers) {
+        foreach ($k in $Headers.Keys) { $hdrCopy[$k] = $Headers[$k] }
+    }
+    $script:HttpTraces.Add(@{
+        Time    = (Get-Date).ToString("HH:mm:ss")
+        Screen  = $(if ($script:LastScreenId) { $script:LastScreenId } else { "PORTADA" })
+        Method  = $Method
+        Url     = $Url
+        ReqBody = $ReqBody
+        Code    = $Code
+        Ms      = $Ms
+        Headers = $hdrCopy
+        RawBody = $RawBody
+        Note    = $Note
+    })
+}
+
+function Format-PrettyJson([string]$Raw) {
+    if ([string]::IsNullOrWhiteSpace($Raw)) { return "" }
+    try {
+        $obj = $Raw | ConvertFrom-Json
+        return ($obj | ConvertTo-Json -Depth 10)
+    } catch {
+        return $Raw
+    }
+}
+
+function Export-PresentationReport {
+    $repDir = Join-Path $RepoDir "reportes"
+    if (-not (Test-Path $repDir)) { [void](New-Item -ItemType Directory -Path $repDir -Force) }
+    $tsFile = (Get-Date).ToString("yyyyMMdd-HHmmss")
+    $fname = "reporte-$tsFile.md"
+    $fullPath = Join-Path $repDir $fname
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine("# Reporte de Ejecución — Billetera Digital Distribuida")
+    [void]$sb.AppendLine("")
+    [void]$sb.AppendLine("- **Fecha y hora:** $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+    [void]$sb.AppendLine("- **Generador:** ``presentacion.bat`` (PowerShell)")
+    [void]$sb.AppendLine("- **Gateway:** ``$Gateway``")
+    [void]$sb.AppendLine("- **Eureka:** ``$Eureka``")
+    [void]$sb.AppendLine("- **Cuentas de prueba:** Origen ``$Origen`` / Destino ``$Destino``")
+    [void]$sb.AppendLine("")
+
+    [void]$sb.AppendLine("## 1. Estado del Clúster Docker")
+    [void]$sb.AppendLine("")
+    $snap = Get-ContainerMapSync
+    if ($snap -and $snap.Map -and $snap.Map.Count -gt 0) {
+        [void]$sb.AppendLine("| Contenedor | Estado | Salud |")
+        [void]$sb.AppendLine("|---|---|---|")
+        foreach ($name in @("primary", "replica1", "replica2", "eureka-server", "ms-cuentas-1", "ms-cuentas-2", "ms-transacciones", "api-gateway")) {
+            if ($snap.Map.ContainsKey($name)) {
+                $info = $snap.Map[$name]
+                $h = if ($info.Health) { $info.Health } else { "-" }
+                [void]$sb.AppendLine("| ``$name`` | $($info.State) | $h |")
+            } else {
+                [void]$sb.AppendLine("| ``$name`` | no encontrado | - |")
+            }
+        }
+    } else {
+        [void]$sb.AppendLine("_No se pudo obtener estado de Docker Compose (daemon inactivo o sin contenedores)._")
+    }
+    [void]$sb.AppendLine("")
+
+    [void]$sb.AppendLine("## 2. Resumen de Pruebas Ejecutadas en la Sesión")
+    [void]$sb.AppendLine("")
+    $hasSummary = $false
+    $sumLines = New-Object System.Collections.Generic.List[string]
+    if ($script:CacheBalanceo) {
+        $hasSummary = $true
+        $okB = @($script:CacheBalanceo | Where-Object Code -eq "200").Count
+        $sumLines.Add("| Slide 04 · Balanceo HTTP | $okB/20 respuestas HTTP 200 (Round Robin) |")
+    }
+    if ($script:CacheTxOk) {
+        $hasSummary = $true
+        $codOk = if ($script:CacheTxOk.Body -and $script:CacheTxOk.Body.datos) { $script:CacheTxOk.Body.datos.codigoComprobante } else { "-" }
+        $sumLines.Add("| Slide 05 · Transferencia P2P ACID | HTTP $($script:CacheTxOk.Code) · Comprobante ``$codOk`` |")
+    }
+    if ($script:CacheTxErr) {
+        $hasSummary = $true
+        $msgErr = if ($script:CacheTxErr.Body) { $script:CacheTxErr.Body.mensaje } else { "-" }
+        $sumLines.Add("| Slide 06 · Rechazo Controlado | HTTP $($script:CacheTxErr.Code) · $msgErr |")
+    }
+    if ($script:CacheLecturas07) {
+        $hasSummary = $true
+        $ok7 = @($script:CacheLecturas07.Results | Where-Object Code -eq "200").Count
+        $sumLines.Add("| Slide 07 · Lecturas en Réplicas | $ok7/20 HTTP 200 ($($script:CacheLecturas07.Sec)s) |")
+    }
+    if ($script:CacheCritico) {
+        $hasSummary = $true
+        $nod8 = if ($script:CacheCritico.Body -and $script:CacheCritico.Body.auditoriaTecnica) { $script:CacheCritico.Body.auditoriaTecnica.nodoBaseDatos } else { "-" }
+        $sumLines.Add("| Slide 08 · Lectura Crítica RYOW | HTTP $($script:CacheCritico.Code) · ``$nod8`` |")
+    }
+    if ($script:CacheEstado12) {
+        $hasSummary = $true
+        $sumLines.Add("| Slide 12 · Estado BD tras Caída | HTTP $($script:CacheEstado12.Code) |")
+    }
+    if ($script:CacheEstado14) {
+        $hasSummary = $true
+        $sumLines.Add("| Slide 14 · Estado BD Recuperación | HTTP $($script:CacheEstado14.Code) |")
+    }
+    if ($hasSummary) {
+        [void]$sb.AppendLine("| Prueba / Diapositiva | Resultado |")
+        [void]$sb.AppendLine("|---|---|")
+        foreach ($sl in $sumLines) { [void]$sb.AppendLine($sl) }
+    } else {
+        [void]$sb.AppendLine("_Aún no se han ejecutado diapositivas en vivo en esta sesión._")
+    }
+    [void]$sb.AppendLine("")
+
+    [void]$sb.AppendLine("## 3. Salidas de Peticiones HTTP (GET / POST)")
+    [void]$sb.AppendLine("")
+    if ($script:HttpTraces.Count -eq 0) {
+        [void]$sb.AppendLine("_No se capturaron peticiones HTTP en esta sesión. Recorre las diapositivas [1-6] antes de exportar._")
+    } else {
+        $idx = 0
+        foreach ($tr in $script:HttpTraces) {
+            $idx++
+            $shortUrl = $tr.Url -replace '^https?://[^/]+', ''
+            [void]$sb.AppendLine("### $idx. ``$($tr.Method) $shortUrl`` -> HTTP ``$($tr.Code)`` ($($tr.Ms) ms)")
+            [void]$sb.AppendLine("")
+            $metaLine = "- **Hora:** $($tr.Time) | **Pantalla:** ``$($tr.Screen)`` | **URL:** ``$($tr.Url)``"
+            if ($tr.Note) { $metaLine += " | **Nota:** $($tr.Note)" }
+            [void]$sb.AppendLine($metaLine)
+            if ($tr.ReqBody) {
+                [void]$sb.AppendLine("")
+                [void]$sb.AppendLine("**Request Body:**")
+                [void]$sb.AppendLine('```json')
+                [void]$sb.AppendLine((Format-PrettyJson $tr.ReqBody))
+                [void]$sb.AppendLine('```')
+            }
+            $relHdrs = @()
+            foreach ($hk in @("x-gateway-handled", "x-service-instance", "x-db-node", "x-db-fallback", "x-consistencia", "content-type")) {
+                if ($tr.Headers -and $tr.Headers.ContainsKey($hk) -and $tr.Headers[$hk]) {
+                    $relHdrs += "``$($hk): $($tr.Headers[$hk])``"
+                }
+            }
+            if ($relHdrs.Count -gt 0) {
+                [void]$sb.AppendLine("- **Headers de respuesta:** $($relHdrs -join ' · ')")
+            }
+            [void]$sb.AppendLine("")
+            [void]$sb.AppendLine("**Response Body:**")
+            $raw = if ($null -ne $tr.RawBody) { $tr.RawBody.Trim() } else { "" }
+            if (-not $raw) {
+                [void]$sb.AppendLine("_Sin cuerpo de respuesta._")
+            } else {
+                $pretty = Format-PrettyJson $raw
+                $lang = if ($pretty.StartsWith("{") -or $pretty.StartsWith("[")) { "json" } elseif ($pretty.StartsWith("<")) { "xml" } else { "text" }
+                if ($pretty.Length -gt 6000) {
+                    $pretty = $pretty.Substring(0, 6000) + "`n... [truncado a 6000 caracteres]"
+                }
+                [void]$sb.AppendLine('```' + $lang)
+                [void]$sb.AppendLine($pretty)
+                [void]$sb.AppendLine('```')
+            }
+            [void]$sb.AppendLine("")
+        }
+    }
+
+    [void]$sb.AppendLine("## 4. Bitácora de Eventos de la Sesión")
+    [void]$sb.AppendLine("")
+    if ($script:EventLogs.Count -eq 0) {
+        [void]$sb.AppendLine("_Sin eventos registrados._")
+    } else {
+        [void]$sb.AppendLine('```text')
+        foreach ($ev in $script:EventLogs) {
+            [void]$sb.AppendLine(("{0} [{1,-4}] [{2,-4}] {3}" -f $ev.Time, $ev.Level, $ev.Cat, $ev.Msg))
+        }
+        [void]$sb.AppendLine('```')
+    }
+
+    [System.IO.File]::WriteAllText($fullPath, $sb.ToString(), [System.Text.Encoding]::UTF8)
+    Add-EventLog "OK" "SYS" ("Reporte exportado: reportes/{0}" -f $fname)
+    return @{ Path = $fullPath; RelPath = ("reportes/{0}" -f $fname); Traces = $script:HttpTraces.Count; Events = $script:EventLogs.Count }
+}
+
+function Show-ExportModal {
+    $script:FirstFrame = $true
+    $script:LastScreenId = "EXPORT"
+    $info = Export-PresentationReport
+    while ($true) {
+        Begin-Frame $false $true
+        Write-CleanLine ("╭" + ("─" * ($script:UiW - 2)) + "╮") "DarkCyan"
+        Write-RowRaw @(
+            @{ T = "│ "; C = "DarkCyan" },
+            @{ T = (Format-Center "EXPORTACION DE REPORTE MARKDOWN" $script:InnerW); C = "Cyan" },
+            @{ T = " │"; C = "DarkCyan" }
+        )
+        Write-CleanLine ("╰" + ("─" * ($script:UiW - 2)) + "╯") "DarkCyan"
+        Write-BlankLine
+        Write-BoxTop "REPORTE GENERADO EXITOSAMENTE" "Green"
+        Write-BoxLine ("Archivo    : {0}" -f $info.RelPath) "Green" "Green"
+        Write-BoxLine ("Ruta       : {0}" -f (Clip-Clean $info.Path ($script:InnerW - 14))) "White" "Green"
+        Write-BoxLine ("Peticiones : {0} salidas GET/POST capturadas" -f $info.Traces) "Cyan" "Green"
+        Write-BoxLine ("Eventos    : {0} registros en bitacora + estado Docker" -f $info.Events) "White" "Green"
+        Write-BoxBottom "Green"
+        Write-BlankLine
+        if ($info.Traces -eq 0) {
+            Write-CleanLine "  [TIP] Recorre las diapositivas [1-6] antes de exportar para incluir salidas GET/POST." "Yellow"
+        } else {
+            Write-CleanLine "  [OK] Listo para adjuntar o copiar en tu informe." "DarkGray"
+        }
+        Write-CleanLine "  [Cualquier tecla] Volver exactamente donde estabas" "Green"
+        End-Frame
+        if ([Console]::IsInputRedirected) { break }
+        $act = Read-SlideKeyLive $false
+        if ($act -eq "RESIZE") { continue }
+        break
+    }
+    $script:FirstFrame = $true
+}
+
 function Invoke-ApiRequest([string]$Method, [string]$Url, [string]$JsonBody = "", [int]$TimeoutSec = 10, [bool]$QuietLog = $false) {
     $headers = @{}
     $rawBody = ""
@@ -991,6 +1209,7 @@ function Invoke-ApiRequest([string]$Method, [string]$Url, [string]$JsonBody = ""
         $ms = [int]$sw.ElapsedMilliseconds
         $lvl = if ($code -match '^2') { "OK" } elseif ($code -eq "409") { "WARN" } else { "ERR" }
         Add-EventLog $lvl "HTTP" ("{0} {1} -> {2} ({3}ms)" -f $Method, $shortP, $code, $ms)
+        Add-HttpTrace $Method $Url $JsonBody $code $ms $headers $rawBody
     }
     return @{ Code = $code; Headers = $headers; Body = $bodyObj; Raw = $rawBody }
 }
@@ -1175,6 +1394,7 @@ function Show-UtilsPanel {
         if ($eb.Length -gt $script:InnerW) { $eb = "[C] Crear .env  |  [B] Abrir Eureka en navegador" }
         Write-BoxLine $eb "White" "DarkCyan"
         Write-BoxLine "[T] Ejecutar suite automatizada P01-P08" "White" "DarkCyan"
+        Write-BoxLine "[E] Exportar reporte completo con salidas GET/POST (.md)" "Yellow" "DarkCyan"
         Write-BoxLine "[1..6] Ir a Seccion 1..6   |   [W] Refrescar  |  [L] Log" "Cyan" "DarkCyan"
         Write-BoxLine "[M / Esc] Volver a Portada |   [?] Ayuda      |  [Q] Salir" "Green" "DarkCyan"
         Write-BoxBottom "DarkCyan"
@@ -1185,6 +1405,7 @@ function Show-UtilsPanel {
             "RESIZE"       { continue }
             "HELP"         { Show-HelpModal }
             "LOG"          { Show-LogModal }
+            "EXPORT"       { Show-ExportModal }
             "PREP"         { Show-CleanPrep }
             "STARTALL"     {
                 Begin-Frame $true $true
@@ -1358,6 +1579,7 @@ function Slide-04([bool]$UseCache = $false) {
         $res = @()
         for ($i = 1; $i -le 20; $i++) {
             $r = Invoke-ApiRequest "GET" "$Gateway/api/cuentas/instancia" "" 5 $true
+            if ($i -eq 1) { Add-HttpTrace "GET" "$Gateway/api/cuentas/instancia" "" $r.Code 0 $r.Headers $r.Raw "Muestra 1/20 del balanceo Round Robin" }
             $inst = if ($r.Headers["x-service-instance"]) { $r.Headers["x-service-instance"] } else { "sin-cabecera" }
             $res += [pscustomobject]@{ Code = $r.Code; Instance = $inst }
         }
@@ -1474,6 +1696,7 @@ function Invoke-LecturasFetch {
     for ($i = 1; $i -le 10; $i++) {
         foreach ($path in @("cuentas/$Origen/contactos", "transacciones/historial/$Origen")) {
             $r = Invoke-ApiRequest "GET" "$Gateway/api/$path" "" 5 $true
+            if ($i -eq 1) { Add-HttpTrace "GET" "$Gateway/api/$path" "" $r.Code 0 $r.Headers $r.Raw "Muestra 1/10 de lecturas ordinarias en replica" }
             $node = if ($r.Headers["x-db-node"]) { $r.Headers["x-db-node"] } else { "desconocido" }
             $fb   = if ($r.Headers["x-db-fallback"]) { $r.Headers["x-db-fallback"] } else { "false" }
             $results += [pscustomobject]@{ Code = $r.Code; Node = $node; Fallback = $fb }
@@ -1999,6 +2222,7 @@ function Run-Deck([int]$StartSlide) {
             "RESIZE" { $useCache = $true; continue }
             "HELP"   { Show-HelpModal; $useCache = $true; continue }
             "LOG"    { Show-LogModal;  $useCache = $true; continue }
+            "EXPORT" { Show-ExportModal; $useCache = $true; continue }
             "PREV" {
                 if ($idx -eq 0) { return "PORTADA" }
                 $idx--
@@ -2131,11 +2355,11 @@ function Show-Portada {
         }
         $startPrompt = if ($script:UiW -ge 68) { "  ► [ESPACIO / ENTER] Iniciar Presentación (Diapositiva 1/15)" } else { "  ► [ESPACIO/→] Iniciar Presentación (1/15)" }
         $navPrompt   = if ($script:UiW -ge 92) {
-            "    Atajos: [1-6] Sección  [B] Eureka  [U] Utilidades  [L] Log  [?] Ayuda  [Q] Salir"
+            "    Atajos: [1-6] Sec  [B] Eureka  [U] Utils  [L] Log  [E] Exportar  [?] Ayuda  [Q] Salir"
         } elseif ($script:UiW -ge 74) {
-            "    [1-6] Sec  [B] Eureka  [U] Utils  [L] Log  [?] Ayuda  [Q] Salir"
+            "    [1-6] Sec  [B] Eureka  [U] Utils  [L] Log  [E] Rep  [?] Ayuda  [Q] Salir"
         } else {
-            "    [1-6] Sec [B] Eur [U] Util [L] Log [?] Ayuda [Q] Salir"
+            "    [1-6] Sec [B] Eur [U] Util [L] Log [E] Rep [?] Ayuda [Q] Sal"
         }
         Write-CleanLine $startPrompt "Green"
         Write-CleanLine $navPrompt "DarkGray"
@@ -2147,6 +2371,7 @@ function Show-Portada {
             "RESIZE"       { continue }
             "HELP"         { Show-HelpModal; $lastSalPoll = [DateTime]::MinValue }
             "LOG"          { Show-LogModal;  $lastSalPoll = [DateTime]::MinValue }
+            "EXPORT"       { Show-ExportModal; $lastSalPoll = [DateTime]::MinValue }
             "QUIT"         { return }
             "EUREKA"       { Open-EurekaBrowser }
             "DOCK_REFRESH" { Update-DockInPlace (Get-ContainerMapSync) }

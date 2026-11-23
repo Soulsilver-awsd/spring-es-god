@@ -69,6 +69,9 @@ BODY_FILE="$TMP/body.json"
 DOCK_RAW="$TMP/dock.raw"
 LEFT_BUF_FILE="$TMP/left_buf.txt"
 LOG_FILE="$TMP/event_log.txt"
+TRACE_DIR="$TMP/traces"
+mkdir -p "$TRACE_DIR"
+TRACE_SEQ=0
 : > "$LOG_FILE"
 : > "$LEFT_BUF_FILE"
 BG_DOCKER_PID=0
@@ -759,6 +762,7 @@ parse_key_char() {
     c|C)   ACT="ENV" ;;
     w|W)   ACT="DOCK_REFRESH" ;;
     l|L)   ACT="LOG" ;;
+    e|E)   ACT="EXPORT" ;;
     h|H|\?) ACT="HELP" ;;
     [1-6]) ACT="B$k" ;;
     *)     ACT="NEXT" ;;
@@ -812,11 +816,11 @@ wait_slide_footer() {
   fi
   local help_line
   if [ "$UI_W" -ge 98 ]; then
-    help_line="  [1-6] Seccion  [R] Actualizar  [M] Inicio  [B] Eureka  [U] Utils  [L] Log  [?] Ayuda  [Q] Salir"
+    help_line="  [1-6] Sec  [R] Act  [M] Inicio  [B] Eureka  [U] Utils  [L] Log  [E] Exportar  [?] Ayuda  [Q] Salir"
   elif [ "$UI_W" -ge 77 ]; then
-    help_line="  [1-6] Sec [R] Act [M] Inicio [B] Eur [U] Util [L] Log [?] Ayuda [Q] Salir"
+    help_line="  [1-6] Sec [R] Act [M] Ini [B] Eur [U] Util [L] Log [E] Rep [?] Ayuda [Q] Salir"
   else
-    help_line="  [1-6] Sec [R] Act [M] Ini [B/U] Util [L] Log [?] Ayuda [Q] Sal"
+    help_line="  [1-6] Sec [R] Act [M] Ini [U] Util [L] Log [E] Rep [?] Ayuda [Q] Sal"
   fi
   ui_line "$C_DIM" "$help_line"
   end_frame
@@ -846,7 +850,8 @@ show_help_modal() {
     box_line "R                  : Re-ejecutar en vivo el slide actual" "$C_YELLOW" "$C_CYAN"
     box_line "M / Esc            : Volver a la Portada principal" "$C_WHITE" "$C_CYAN"
     box_line "B / U / W          : Abrir Eureka / Utilidades / Dock" "$C_WHITE" "$C_CYAN"
-    box_line "L  |  H / ? / F1   : Ver log completo | Abrir esta ayuda" "$C_CYAN" "$C_CYAN"
+    box_line "L  |  E            : Ver log completo | Exportar reporte (.md)" "$C_CYAN" "$C_CYAN"
+    box_line "H / ? / F1         : Abrir esta ayuda" "$C_CYAN" "$C_CYAN"
     box_line "Q                  : Salir de la presentacion" "$C_DIM" "$C_CYAN"
     box_bottom "$C_CYAN"
     ui_blank
@@ -903,6 +908,237 @@ show_log_modal() {
   FIRST_FRAME=1
 }
 
+record_http_trace() {
+  local method="$1" url="$2" req_json="$3" code="$4" ms="$5" hdr_f="$6" body_f="$7" note="${8:-}"
+  TRACE_SEQ=$((TRACE_SEQ + 1))
+  local id
+  printf -v id '%04d' "$TRACE_SEQ"
+  local ts scr
+  ts="$(date +%H:%M:%S)"
+  scr="${LAST_SCREEN_ID:-PORTADA}"
+  printf '%s|%s|%s|%s|%s|%s|%s\n' "$ts" "$scr" "$method" "$url" "$code" "$ms" "${note//|//}" > "$TRACE_DIR/${id}.meta"
+  [ -n "$req_json" ] && printf '%s' "$req_json" > "$TRACE_DIR/${id}.req"
+  [ -f "$hdr_f" ] && cp "$hdr_f" "$TRACE_DIR/${id}.hdr"
+  [ -f "$body_f" ] && cp "$body_f" "$TRACE_DIR/${id}.body"
+}
+
+pretty_json_file() {
+  local f="$1"
+  [ -s "$f" ] || return 0
+  case "$JSON_TOOL" in
+    jq) jq . "$f" 2>/dev/null || cat "$f" ;;
+    python3|python)
+      "$JSON_TOOL" -m json.tool "$f" 2>/dev/null || cat "$f"
+      ;;
+    *) cat "$f" ;;
+  esac
+}
+
+pretty_json_str() {
+  local s="$1"
+  [ -n "$s" ] || return 0
+  case "$JSON_TOOL" in
+    jq) printf '%s' "$s" | jq . 2>/dev/null || printf '%s\n' "$s" ;;
+    python3|python)
+      printf '%s' "$s" | "$JSON_TOOL" -m json.tool 2>/dev/null || printf '%s\n' "$s"
+      ;;
+    *) printf '%s\n' "$s" ;;
+  esac
+}
+
+export_presentation_report() {
+  local rep_dir="$REPO_DIR/reportes"
+  mkdir -p "$rep_dir"
+  local ts_file fname full_path
+  ts_file="$(date +%Y%m%d-%H%M%S)"
+  fname="reporte-${ts_file}.md"
+  full_path="$rep_dir/$fname"
+
+  {
+    printf '# Reporte de Ejecución — Billetera Digital Distribuida\n\n'
+    printf -- '- **Fecha y hora:** %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf -- '- **Generador:** `presentacion.sh` (Bash)\n'
+    printf -- '- **Gateway:** `%s`\n' "$GATEWAY"
+    printf -- '- **Eureka:** `%s`\n' "$EUREKA"
+    printf -- '- **Cuentas de prueba:** Origen `%s` / Destino `%s`\n\n' "$ORIGEN" "$DESTINO"
+
+    printf '## 1. Estado del Clúster Docker\n\n'
+    fetch_dock_sync
+    if [ -s "$DOCK_RAW" ]; then
+      printf '| Contenedor | Estado | Salud |\n|---|---|---|\n'
+      local cname line st hl
+      for cname in primary replica1 replica2 eureka-server ms-cuentas-1 ms-cuentas-2 ms-transacciones api-gateway; do
+        line="$(grep "^${cname}|" "$DOCK_RAW" 2>/dev/null | head -n 1 || true)"
+        if [ -n "$line" ]; then
+          st="$(echo "$line" | cut -d'|' -f2)"
+          hl="$(echo "$line" | cut -d'|' -f3)"
+          [ -z "$hl" ] && hl="-"
+          printf '| `%s` | %s | %s |\n' "$cname" "$st" "$hl"
+        else
+          printf '| `%s` | no encontrado | - |\n' "$cname"
+        fi
+      done
+    else
+      printf '_No se pudo obtener estado de Docker Compose (daemon inactivo o sin contenedores)._\n'
+    fi
+    printf '\n'
+
+    printf '## 2. Resumen de Pruebas Ejecutadas en la Sesión\n\n'
+    local has_sum=0 sum_rows=""
+    if [ "${CACHE_BAL_READY:-0}" -eq 1 ]; then
+      has_sum=1
+      sum_rows="${sum_rows}| Slide 04 · Balanceo HTTP | ${CACHE_BAL_OK:-0}/20 respuestas HTTP 200 (Round Robin) |\n"
+    fi
+    if [ -n "$CACHE_TX_OK_FILE" ] && [ -f "$CACHE_TX_OK_FILE" ]; then
+      has_sum=1
+      local c5 cod5
+      c5="$(cat "$TMP/cache_tx_ok.code" 2>/dev/null || echo "-")"
+      cod5="$(extract_transfer_fields "$CACHE_TX_OK_FILE" | tr -d '\r' | cut -d'|' -f2)"
+      sum_rows="${sum_rows}| Slide 05 · Transferencia P2P ACID | HTTP $c5 · Comprobante \`$cod5\` |\n"
+    fi
+    if [ -n "$CACHE_TX_ERR_FILE" ] && [ -f "$CACHE_TX_ERR_FILE" ]; then
+      has_sum=1
+      local c6 msg6
+      c6="$(cat "$TMP/cache_tx_err.code" 2>/dev/null || echo "-")"
+      msg6="$(extract_transfer_fields "$CACHE_TX_ERR_FILE" | tr -d '\r' | cut -d'|' -f1)"
+      sum_rows="${sum_rows}| Slide 06 · Rechazo Controlado | HTTP $c6 · $msg6 |\n"
+    fi
+    if [ "${CACHE_LECT07_READY:-0}" -eq 1 ] && [ -f "$TMP/lect_meta_07.txt" ]; then
+      has_sum=1
+      local ok7 sec7
+      ok7="$(cut -d'|' -f1 "$TMP/lect_meta_07.txt")"
+      sec7="$(cut -d'|' -f5 "$TMP/lect_meta_07.txt")"
+      sum_rows="${sum_rows}| Slide 07 · Lecturas en Réplicas | $ok7/20 HTTP 200 (${sec7}s) |\n"
+    fi
+    if [ -n "$CACHE_CRIT_CODE" ]; then
+      has_sum=1
+      sum_rows="${sum_rows}| Slide 08 · Lectura Crítica RYOW | HTTP $CACHE_CRIT_CODE |\n"
+    fi
+    if [ -n "$CACHE_EST12_CODE" ]; then
+      has_sum=1
+      sum_rows="${sum_rows}| Slide 12 · Estado BD tras Caída | HTTP $CACHE_EST12_CODE |\n"
+    fi
+    if [ -n "$CACHE_EST14_CODE" ]; then
+      has_sum=1
+      sum_rows="${sum_rows}| Slide 14 · Estado BD Recuperación | HTTP $CACHE_EST14_CODE |\n"
+    fi
+    if [ "$has_sum" -eq 1 ]; then
+      printf '| Prueba / Diapositiva | Resultado |\n|---|---|\n'
+      printf '%b' "$sum_rows"
+    else
+      printf '_Aún no se han ejecutado diapositivas en vivo en esta sesión._\n'
+    fi
+    printf '\n'
+
+    printf '## 3. Salidas de Peticiones HTTP (GET / POST)\n\n'
+    local mf idx=0
+    shopt -s nullglob
+    local metas=("$TRACE_DIR"/*.meta)
+    shopt -u nullglob
+    if [ "${#metas[@]}" -eq 0 ]; then
+      printf '_No se capturaron peticiones HTTP en esta sesión. Recorre las diapositivas [1-6] antes de exportar._\n\n'
+    else
+      for mf in "${metas[@]}"; do
+        idx=$((idx + 1))
+        local base="${mf%.meta}"
+        local ts scr method url code ms note short_url
+        IFS='|' read -r ts scr method url code ms note < "$mf"
+        short_url="$(echo "$url" | sed -E 's|^https?://[^/]+||')"
+        [ -z "$short_url" ] && short_url="$url"
+        printf '### %d. `%s %s` -> HTTP `%s` (%s ms)\n\n' "$idx" "$method" "$short_url" "$code" "$ms"
+        printf -- '- **Hora:** %s | **Pantalla:** `%s` | **URL:** `%s`' "$ts" "$scr" "$url"
+        [ -n "$note" ] && printf ' | **Nota:** %s' "$note"
+        printf '\n'
+
+        if [ -s "${base}.req" ]; then
+          printf '\n**Request Body:**\n```json\n'
+          pretty_json_file "${base}.req"
+          printf '\n```\n'
+        fi
+
+        if [ -s "${base}.hdr" ]; then
+          local rel_hdrs="" hk hv
+          for hk in X-Gateway-Handled X-Service-Instance X-Db-Node X-Db-Fallback X-Consistencia Content-Type; do
+            hv="$(grep -i "^${hk}:" "${base}.hdr" 2>/dev/null | head -n 1 | cut -d':' -f2- | sed 's/^[[:space:]]*//; s/\r$//' || true)"
+            if [ -n "$hv" ]; then
+              [ -n "$rel_hdrs" ] && rel_hdrs="${rel_hdrs} · "
+              rel_hdrs="${rel_hdrs}\`${hk}: ${hv}\`"
+            fi
+          done
+          [ -n "$rel_hdrs" ] && printf -- '- **Headers de respuesta:** %s\n' "$rel_hdrs"
+        fi
+
+        printf '\n**Response Body:**\n'
+        if [ ! -s "${base}.body" ]; then
+          printf '_Sin cuerpo de respuesta._\n\n'
+        else
+          local pretty_out lang="text" first_ch
+          pretty_out="$(pretty_json_file "${base}.body")"
+          first_ch="$(printf '%s' "$pretty_out" | sed 's/^[[:space:]]*//' | head -c 1)"
+          [ "$first_ch" = "{" ] || [ "$first_ch" = "[" ] && lang="json"
+          [ "$first_ch" = "<" ] && lang="xml"
+          printf '```%s\n' "$lang"
+          if [ "${#pretty_out}" -gt 6000 ]; then
+            printf '%s\n... [truncado a 6000 caracteres]\n' "${pretty_out:0:6000}"
+          else
+            printf '%s\n' "$pretty_out"
+          fi
+          printf '```\n\n'
+        fi
+      done
+    fi
+
+    printf '## 4. Bitácora de Eventos de la Sesión\n\n'
+    if [ ! -s "$LOG_FILE" ]; then
+      printf '_Sin eventos registrados._\n'
+    else
+      printf '```text\n'
+      while IFS='|' read -r lts llvl lcat lmsg; do
+        printf '%s [%-4s] [%-4s] %s\n' "$lts" "$llvl" "$lcat" "$lmsg"
+      done < "$LOG_FILE"
+      printf '```\n'
+    fi
+  } > "$full_path"
+
+  add_event_log "OK" "SYS" "Reporte exportado: reportes/$fname"
+  EXPORT_LAST_PATH="$full_path"
+  EXPORT_LAST_REL="reportes/$fname"
+  EXPORT_LAST_TRACES="$TRACE_SEQ"
+  EXPORT_LAST_EVENTS="$(wc -l < "$LOG_FILE" 2>/dev/null | tr -d ' ')"
+}
+
+show_export_modal() {
+  FIRST_FRAME=1
+  LAST_SCREEN_ID="EXPORT"
+  export_presentation_report
+  while true; do
+    begin_frame 0 1
+    printf '%s%s╭%s╮%s%s\n' "$MARGIN" "$C_CYAN" "$(repeat_char '─' "$((UI_W - 2))")" "$C_RESET" "$CLR_EOL"
+    printf '%s%s│ %s%s%s │%s%s\n' "$MARGIN" "$C_CYAN" "${C_BOLD}${C_CYAN}" "$(pad_center "EXPORTACION DE REPORTE MARKDOWN" "$INNER_W")" "$C_CYAN" "$C_RESET" "$CLR_EOL"
+    printf '%s%s╰%s╯%s%s\n' "$MARGIN" "$C_CYAN" "$(repeat_char '─' "$((UI_W - 2))")" "$C_RESET" "$CLR_EOL"
+    ui_blank
+    box_top "REPORTE GENERADO EXITOSAMENTE" "$C_GREEN"
+    box_line "Archivo    : $EXPORT_LAST_REL" "$C_GREEN" "$C_GREEN"
+    box_line "Ruta       : $(clip_clean "$EXPORT_LAST_PATH" "$((INNER_W - 14))")" "$C_WHITE" "$C_GREEN"
+    box_line "Peticiones : $EXPORT_LAST_TRACES salidas GET/POST capturadas" "$C_CYAN" "$C_GREEN"
+    box_line "Eventos    : ${EXPORT_LAST_EVENTS:-0} registros en bitacora + estado Docker" "$C_WHITE" "$C_GREEN"
+    box_bottom "$C_GREEN"
+    ui_blank
+    if [ "${EXPORT_LAST_TRACES:-0}" -eq 0 ]; then
+      ui_line "$C_YELLOW" "  [TIP] Recorre las diapositivas [1-6] antes de exportar para incluir salidas GET/POST."
+    else
+      ui_line "$C_DIM" "  [OK] Listo para adjuntar o copiar en tu informe."
+    fi
+    ui_line "${C_BOLD}${C_GREEN}" "  [Cualquier tecla] Volver exactamente donde estabas"
+    end_frame
+    [ ! -t 0 ] && break
+    read_slide_key_live 0
+    [ "$ACT" = "RESIZE" ] && continue
+    break
+  done
+  FIRST_FRAME=1
+}
+
 api_req() {
   local method="$1" url="$2" json="${3:-}" tout="${4:-10}" quiet="${5:-0}" code t0=0 t1=0
   [ "$quiet" -eq 0 ] && t0="$(now_ms)"
@@ -921,6 +1157,7 @@ api_req() {
     [[ "$code" == 2* ]] && lvl="OK"
     [ "$code" = "409" ] && lvl="WARN"
     add_event_log "$lvl" "HTTP" "$method $short_p -> $code (${ms}ms)"
+    record_http_trace "$method" "$url" "$json" "$code" "$ms" "$HEADERS_FILE" "$BODY_FILE"
   fi
   echo "$code"
 }
@@ -1161,6 +1398,7 @@ show_utils_panel() {
     [ "${#eb}" -gt "$INNER_W" ] && eb="[C] Crear .env  |  [B] Abrir Eureka en navegador"
     box_line "$eb" "$C_WHITE" "$C_CYAN"
     box_line "[T] Ejecutar suite automatizada P01-P08" "$C_WHITE" "$C_CYAN"
+    box_line "[E] Exportar reporte completo con salidas GET/POST (.md)" "$C_YELLOW" "$C_CYAN"
     box_line "[1..6] Ir a Seccion 1..6   |   [W] Refrescar  |  [L] Log" "$C_CYAN" "$C_CYAN"
     box_line "[M / Esc] Volver a Portada |   [?] Ayuda      |  [Q] Salir" "$C_GREEN" "$C_CYAN"
     box_bottom "$C_CYAN"
@@ -1171,6 +1409,7 @@ show_utils_panel() {
       RESIZE)       continue ;;
       HELP)         show_help_modal ;;
       LOG)          show_log_modal ;;
+      EXPORT)       show_export_modal ;;
       PREP)         show_clean_prep ;;
       STARTALL)
         begin_frame 1 1
@@ -1379,6 +1618,7 @@ slide_04() {
     local i code inst ok_cnt=0
     for i in $(seq 1 20); do
       code="$(api_req GET "$GATEWAY/api/cuentas/instancia" "" 5 1)"
+      [ "$i" -eq 1 ] && record_http_trace "GET" "$GATEWAY/api/cuentas/instancia" "" "$code" "0" "$HEADERS_FILE" "$BODY_FILE" "Muestra 1/20 del balanceo Round Robin"
       [ "$code" = "200" ] && ok_cnt=$((ok_cnt + 1))
       inst="$(get_header "X-Service-Instance")"; [ -z "$inst" ] && inst="sin-cabecera"
       printf '%s %s\n' "$code" "$inst" >> "$TMP/balanceo.txt"
@@ -1518,6 +1758,7 @@ fetch_lecturas_data() {
   for i in $(seq 1 10); do
     for u in "cuentas/$ORIGEN/contactos" "transacciones/historial/$ORIGEN"; do
       code="$(api_req GET "$GATEWAY/api/$u" "" 5 1)"
+      [ "$i" -eq 1 ] && record_http_trace "GET" "$GATEWAY/api/$u" "" "$code" "0" "$HEADERS_FILE" "$BODY_FILE" "Muestra 1/10 de lecturas ordinarias en replica"
       if [ "$code" = "200" ]; then
         ok_cnt=$((ok_cnt + 1))
       else
@@ -2097,6 +2338,7 @@ run_deck() {
       RESIZE) use_cache=1; continue ;;
       HELP)   show_help_modal; use_cache=1; continue ;;
       LOG)    show_log_modal;  use_cache=1; continue ;;
+      EXPORT) show_export_modal; use_cache=1; continue ;;
       PREV)
         [ "$idx" -eq 0 ] && { ACT="PORTADA"; return; }
         idx=$((idx - 1))
@@ -2227,12 +2469,12 @@ show_portada() {
       render_log_strip
     fi
     local sp="  ► [ESPACIO / ENTER] Iniciar Presentación (Diapositiva 1/15)"
-    local np="    Atajos: [1-6] Sección  [B] Eureka  [U] Utilidades  [L] Log  [?] Ayuda  [Q] Salir"
+    local np="    Atajos: [1-6] Sec  [B] Eureka  [U] Utils  [L] Log  [E] Exportar  [?] Ayuda  [Q] Salir"
     [ "$UI_W" -lt 68 ] && sp="  ► [ESPACIO/→] Iniciar Presentación (1/15)"
     if [ "$UI_W" -lt 74 ]; then
-      np="    [1-6] Sec [B] Eur [U] Util [L] Log [?] Ayuda [Q] Salir"
+      np="    [1-6] Sec [B] Eur [U] Util [L] Log [E] Rep [?] Ayuda [Q] Salir"
     elif [ "$UI_W" -lt 92 ]; then
-      np="    [1-6] Sec  [B] Eureka  [U] Utils  [L] Log  [?] Ayuda  [Q] Salir"
+      np="    [1-6] Sec  [B] Eureka  [U] Utils  [L] Log  [E] Rep  [?] Ayuda  [Q] Salir"
     fi
     ui_line "${C_BOLD}${C_GREEN}" "$sp"
     ui_line "$C_DIM" "$np"
@@ -2243,6 +2485,7 @@ show_portada() {
       RESIZE)       continue ;;
       HELP)         show_help_modal; last_sal_poll=0 ;;
       LOG)          show_log_modal;  last_sal_poll=0 ;;
+      EXPORT)       show_export_modal; last_sal_poll=0 ;;
       QUIT)         return ;;
       EUREKA)       open_eureka ;;
       DOCK_REFRESH) fetch_dock_sync; update_dock_in_place ;;
