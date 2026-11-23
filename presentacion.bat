@@ -2152,8 +2152,17 @@ function Slide-14([bool]$UseCache = $false) {
     Write-SlideChrome 14 5 "Reincorporación Automática · Umbral 2/2" $UseCache $true
     Write-BlankLine
     if (-not $UseCache -or -not $script:CacheEstado14) {
-        $pRow = Show-LivePending "Consultando reincorporacion (/api/cuentas/db/estado)…"
-        $script:CacheEstado14 = Invoke-ApiRequest "GET" "$Gateway/api/cuentas/db/estado" "" 5
+        $pRow = Show-LivePending "Esperando umbral 2/2 de reincorporacion para replica1 (~6s)…"
+        $retries = 0
+        while ($retries -lt 12) {
+            $script:CacheEstado14 = Invoke-ApiRequest "GET" "$Gateway/api/cuentas/db/estado" "" 5
+            if ($script:CacheEstado14 -and $script:CacheEstado14.Code -eq 200 -and $script:CacheEstado14.Json) {
+                $r1 = $script:CacheEstado14.Json.replicas | Where-Object { $_.nodo -eq "REPLICA_1" }
+                if ($r1 -and $r1.available -eq $true) { break }
+            }
+            $retries++
+            Start-Sleep -Seconds 1
+        }
         Restore-LivePending $pRow
     }
     Render-DbEstadoBox "SALUD DE REPLICAS TRAS RECUPERACION (/api/cuentas/db/estado)" $script:CacheEstado14

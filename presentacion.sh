@@ -2288,9 +2288,29 @@ slide_14() {
   slide_chrome 14 5 "Reincorporación Automática · Umbral 2/2" "$use_cache" 1
   ui_blank
   if [ "$use_cache" -eq 0 ] || [ -z "$CACHE_EST14_CODE" ]; then
-    show_pending_msg "Consultando reincorporacion (/api/cuentas/db/estado)…"
-    CACHE_EST14_CODE="$(api_req GET "$GATEWAY/api/cuentas/db/estado" "" 5 0 "Estado del cluster PostgreSQL tras reincorporacion de replica1")"
-    cp "$BODY_FILE" "$TMP/est14_cache.json" 2>/dev/null || true
+    show_pending_msg "Esperando umbral 2/2 de reincorporación para replica1 (~6s)…"
+    local retries=0 r1_avail="false"
+    while [ "$retries" -lt 12 ]; do
+      CACHE_EST14_CODE="$(api_req GET "$GATEWAY/api/cuentas/db/estado" "" 5 1)"
+      cp "$BODY_FILE" "$TMP/est14_cache.json" 2>/dev/null || true
+      if [ "$CACHE_EST14_CODE" = "200" ] && [ -f "$TMP/est14_cache.json" ]; then
+        case "$JSON_TOOL" in
+          jq)
+            r1_avail="$(jq -r '.replicas[] | select(.nodo=="REPLICA_1") | .available' "$TMP/est14_cache.json" 2>/dev/null || echo "false")"
+            ;;
+          python3|python)
+            r1_avail="$("$JSON_TOOL" -c 'import sys, json; data=json.load(open(sys.argv[1])); print(next((str(r.get("available")).lower() for r in data.get("replicas", []) if r.get("nodo")=="REPLICA_1"), "false"))' "$TMP/est14_cache.json" 2>/dev/null || echo "false")"
+            ;;
+          *)
+            r1_avail="$(grep -A 3 '"REPLICA_1"' "$TMP/est14_cache.json" 2>/dev/null | grep '"available"' | grep -o 'true' || echo "false")"
+            ;;
+        esac
+        [ "$r1_avail" = "true" ] && break
+      fi
+      retries=$((retries + 1))
+      sleep 1
+    done
+    record_http_trace "GET" "$GATEWAY/api/cuentas/db/estado" "" "$CACHE_EST14_CODE" "0" "$HEADERS_FILE" "$BODY_FILE" "Estado del cluster PostgreSQL tras reincorporacion de replica1"
     restore_pending_msg
   fi
   render_db_estado_box "SALUD DE REPLICAS TRAS RECUPERACION (/api/cuentas/db/estado)" "$CACHE_EST14_CODE" "$TMP/est14_cache.json"
