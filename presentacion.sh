@@ -2327,8 +2327,9 @@ slide_15() {
       "  + retry GET GW|  sin auto-reset|· Cerrar /mov-int" \
       "· Flyway adv. lock|· Sin idempotencia|  + Sagas / Outbox"
   fi
-  local quote='"Más de uno de todo, y saber esquivar al que falla. Sistema distribuido."'
-  [ "$INNER_W" -lt 74 ] && quote='"Replicar cada capa y esquivar al nodo que falla."'
+  local quote='"Redundancia en cada capa y failover transparente con integridad ACID."'
+  [ "$INNER_W" -lt 74 ] && quote='"Redundancia activa, failover transparente e integridad ACID."'
+  [ "$INNER_W" -lt 64 ] && quote='"Failover transparente e integridad ACID."'
   box_top "SÍNTESIS FINAL" "$C_CYAN"
   box_line "$(pad_center "$quote" "$INNER_W")" "$C_CYAN" "$C_CYAN"
   box_bottom "$C_CYAN"

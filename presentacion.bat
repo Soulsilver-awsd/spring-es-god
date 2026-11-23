@@ -2195,9 +2195,11 @@ function Slide-15([bool]$UseCache = $false) {
     }
     Write-BoxTop "SÍNTESIS FINAL" "Cyan"
     $quote = if ($script:InnerW -ge 74) {
-        '"Más de uno de todo, y saber esquivar al que falla. Sistema distribuido."'
+        '"Redundancia en cada capa y failover transparente con integridad ACID."'
+    } elseif ($script:InnerW -ge 64) {
+        '"Redundancia activa, failover transparente e integridad ACID."'
     } else {
-        '"Replicar cada capa y esquivar al nodo que falla."'
+        '"Failover transparente e integridad ACID."'
     }
     Write-BoxLine (Format-Center $quote $script:InnerW) "Cyan" "Cyan"
     Write-BoxBottom "Cyan"
