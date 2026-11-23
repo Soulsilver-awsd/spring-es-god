@@ -11,7 +11,9 @@ if [ "${#_utf_chk}" -ne 1 ]; then
 fi
 export LC_NUMERIC=C
 
-REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+REPO_DIR="$(cd "$(dirname "$SCRIPT_PATH")" 2>/dev/null && pwd || pwd)"
+[ -f "$REPO_DIR/docker-compose.yml" ] || REPO_DIR="$PWD"
 cd "$REPO_DIR" || exit 1
 
 GATEWAY="${GATEWAY:-http://localhost:8080}"
@@ -20,17 +22,41 @@ ORIGEN="0991112233"
 DESTINO="0984445566"
 
 FIRST_FRAME=1
+FORCE_CLEAR=0
+WIN_W=80
+WIN_H=25
+UI_W=78
+INNER_W=74
+PAD_L=1
+PAD_T=0
+MARGIN=" "
 DOCK_ROW=5
+RESIZED=0
+
+LAST_DOCK_SIG=""
+LAST_DOCK_POLL=0
+DOCK_BG_PID=0
+
 LAST_TX_NODO="PRIMARY (recovery=false)"
 LAST_TX_CODIGO="TX-2026-0001"
-LAST_BURST_SUMMARY=""
+LAST_BURST_LINES=()
+STOP_REP_MS=0
+START_REP_MS=0
+CACHE_PS_READY=0
+CACHE_EUREKA_CODE=""
+CACHE_BAL_READY=0
 CACHE_TX_OK_FILE=""
 CACHE_TX_ERR_FILE=""
+CACHE_LECT07_READY=0
+CACHE_LECT11_READY=0
+CACHE_CRIT_CODE=""
+CACHE_EST12_CODE=""
+CACHE_EST14_CODE=""
 
 TMP="$(mktemp -d)"
 HEADERS_FILE="$TMP/headers.txt"
 BODY_FILE="$TMP/body.json"
-TRAFICO_PID=0
+DOCK_RAW="$TMP/dock.raw"
 BG_DOCKER_PID=0
 
 # Colores ANSI
@@ -44,14 +70,18 @@ C_RED=$'\033[31m'
 C_BLUE=$'\033[34m'
 C_MAGENTA=$'\033[35m'
 C_WHITE=$'\033[97m'
+CLR_EOL=""
+[ -t 1 ] && CLR_EOL=$'\033[K'
+LAST_SCREEN_ID=""
 
 cleanup() {
-  [ "$TRAFICO_PID" -gt 0 ] && kill "$TRAFICO_PID" 2>/dev/null || true
-  [ "$BG_DOCKER_PID" -gt 0 ] && wait "$BG_DOCKER_PID" 2>/dev/null || true
+  [ "$BG_DOCKER_PID" -gt 0 ] && kill "$BG_DOCKER_PID" 2>/dev/null || true
+  [ "$DOCK_BG_PID" -gt 0 ] && kill "$DOCK_BG_PID" 2>/dev/null || true
   rm -rf "$TMP"
   [ -t 1 ] && printf '\033[?25h%s' "$C_RESET" || printf '%s' "$C_RESET"
 }
 trap cleanup EXIT INT TERM
+trap 'RESIZED=1' WINCH 2>/dev/null || true
 
 # Parser JSON con fallback si no hay jq
 JSON_TOOL="raw"
@@ -63,20 +93,18 @@ elif command -v python >/dev/null 2>&1 && python -c "import json" >/dev/null 2>&
   JSON_TOOL="python"
 fi
 
-begin_frame() {
-  local hard="${1:-0}"
-  [ ! -t 1 ] && return
-  printf '\033[?25l'
-  if [ "$FIRST_FRAME" -eq 1 ] || [ "$hard" -eq 1 ]; then
-    [ -n "${TERM:-}" ] && clear 2>/dev/null || printf '\033[2J\033[H'
-    FIRST_FRAME=0
+now_ms() {
+  local m
+  m="$(date +%s%3N 2>/dev/null || true)"
+  if [[ "$m" =~ ^[0-9]+$ ]]; then
+    echo "$m"
   else
-    printf '\033[H'
+    echo "$(date +%s)000"
   fi
 }
 
-end_frame() {
-  [ -t 1 ] && printf '\033[J' || true
+fmt_ms_sec() {
+  awk -v m="${1:-0}" 'BEGIN { printf "%.2f", m / 1000.0 }'
 }
 
 repeat_char() {
@@ -88,67 +116,192 @@ repeat_char() {
 
 pad_fixed() {
   local txt="${1//$'\r'/}" w="$2"
+  [ "$w" -le 0 ] && return
   local len=${#txt}
   if [ "$len" -gt "$w" ]; then
-    printf '%s...' "${txt:0:$((w - 3))}"
+    [ "$w" -le 3 ] && printf '%s' "${txt:0:$w}" || printf '%s...' "${txt:0:$((w - 3))}"
   else
     printf '%s%*s' "$txt" "$((w - len))" ''
   fi
 }
 
+pad_center() {
+  local txt="${1//$'\r'/}" w="$2"
+  local len=${#txt}
+  if [ "$len" -ge "$w" ]; then
+    pad_fixed "$txt" "$w"
+  else
+    local l=$(( (w - len) / 2 ))
+    local r=$((w - len - l))
+    printf '%*s%s%*s' "$l" '' "$txt" "$r" ''
+  fi
+}
+
+shopt -s checkwinsize 2>/dev/null || true
+
+update_ui_metrics() {
+  local w="${DEMO_COLS:-80}" h="${DEMO_LINES:-25}"
+  if [ -t 1 ]; then
+    if command -v tput >/dev/null 2>&1; then
+      w="$(tput cols 2>/dev/null || echo "${COLUMNS:-80}")"
+      h="$(tput lines 2>/dev/null || echo "${LINES:-25}")"
+    else
+      w="${COLUMNS:-80}"; h="${LINES:-25}"
+    fi
+  fi
+  [[ "$w" =~ ^[0-9]+$ ]] || w=80
+  [[ "$h" =~ ^[0-9]+$ ]] || h=25
+
+  local new_ui_w=$((w - 2))
+  [ "$new_ui_w" -gt 100 ] && new_ui_w=100
+  [ "$new_ui_w" -lt 64 ] && new_ui_w=64
+  local new_pad_l=$(( (w - new_ui_w) / 2 ))
+  [ "$new_pad_l" -lt 0 ] && new_pad_l=0
+  local new_pad_t=0
+  if [ -t 1 ] && [ "$h" -ge 28 ]; then
+    new_pad_t=$(( (h - 24) / 3 ))
+    [ "$new_pad_t" -gt 3 ] && new_pad_t=3
+  fi
+  if [ "$new_ui_w" -ne "$UI_W" ] || [ "$new_pad_l" -ne "$PAD_L" ] || [ "$new_pad_t" -ne "$PAD_T" ]; then
+    FORCE_CLEAR=1
+  fi
+  WIN_W="$w"; WIN_H="$h"; UI_W="$new_ui_w"; INNER_W=$((new_ui_w - 4))
+  PAD_L="$new_pad_l"; PAD_T="$new_pad_t"
+  MARGIN="$(repeat_char ' ' "$new_pad_l")"
+  RESIZED=0
+}
+
+ui_blank() { printf '%s\n' "$CLR_EOL"; }
+ui_line() { printf '%s%s%s%s%s\n' "$MARGIN" "${1:-}" "${2:-}" "$C_RESET" "$CLR_EOL"; }
+
+begin_frame() {
+  local hard="${1:-0}"
+  update_ui_metrics
+  [ ! -t 1 ] && return
+  printf '\033[?25l'
+  if [ "$FIRST_FRAME" -eq 1 ] || [ "$hard" -eq 1 ] || [ "$FORCE_CLEAR" -eq 1 ]; then
+    [ -n "${TERM:-}" ] && clear 2>/dev/null || printf '\033[2J\033[H'
+    FIRST_FRAME=0
+    FORCE_CLEAR=0
+  else
+    printf '\033[H'
+  fi
+  local i=0
+  while [ "$i" -lt "$PAD_T" ]; do
+    ui_blank
+    i=$((i + 1))
+  done
+}
+
+end_frame() {
+  [ -t 1 ] && printf '\033[J' || true
+}
+
 get_progress_bar() {
-  local num="$1" total="${2:-15}" filled empty
-  filled=$(( (num * 10 + total / 2) / total ))
-  [ "$filled" -gt 10 ] && filled=10
-  empty=$((10 - filled))
+  local num="$1" total="${2:-15}" w="${3:-10}" filled empty
+  filled=$(( (num * w + total / 2) / total ))
+  [ "$filled" -gt "$w" ] && filled="$w"
+  empty=$((w - filled))
   printf '[%s%s]' "$(repeat_char '█' "$filled")" "$(repeat_char '░' "$empty")"
 }
 
 box_top() {
   local title=" $1 " col="${2:-$C_DIM}"
-  local fill=$((75 - ${#title}))
+  local max_t=$((UI_W - 6))
+  [ "${#title}" -gt "$max_t" ] && title="${title:0:$max_t}"
+  local fill=$(( (UI_W - 3) - ${#title} ))
   [ "$fill" -lt 2 ] && fill=2
-  printf '%s┌─%s%s┐%s\n' "$col" "$title" "$(repeat_char '─' "$fill")" "$C_RESET"
+  printf '%s%s┌─%s%s┐%s%s\n' "$MARGIN" "$col" "$title" "$(repeat_char '─' "$fill")" "$C_RESET" "$CLR_EOL"
 }
 
 box_line() {
   local txt="$1" tcol="${2:-$C_WHITE}" bcol="${3:-$C_DIM}"
-  printf '%s│ %s%s%s │%s\n' "$bcol" "$tcol" "$(pad_fixed "$txt" 74)" "$bcol" "$C_RESET"
+  printf '%s%s│ %s%s%s │%s%s\n' "$MARGIN" "$bcol" "$tcol" "$(pad_fixed "$txt" "$INNER_W")" "$bcol" "$C_RESET" "$CLR_EOL"
 }
 
 box_bottom() {
   local col="${1:-$C_DIM}"
-  printf '%s└%s┘%s\n' "$col" "$(repeat_char '─' 76)" "$C_RESET"
+  printf '%s%s└%s┘%s%s\n' "$MARGIN" "$col" "$(repeat_char '─' "$((UI_W - 2))")" "$C_RESET" "$CLR_EOL"
 }
 
-# Estado persistente del cluster para el panel inmerso
-fetch_cluster_dock_data() {
+write_divider() {
+  printf '%s%s%s%s%s\n' "$MARGIN" "$C_DIM" "$(repeat_char '─' "$UI_W")" "$C_RESET" "$CLR_EOL"
+}
+
+# Estado persistente del cluster (cacheado + refresco asincrono)
+parse_dock_raw() {
   DOCK_OK=0; DOCK_HEALTHY=0; DOCK_RUNNING=0
   local svc
   for svc in api-gateway eureka-server ms-cuentas-1 ms-cuentas-2 ms-transacciones primary replica1 replica2; do
     eval "D_SYM_${svc//-/_}='?'"
     eval "D_COL_${svc//-/_}=\"\$C_DIM\""
   done
-  local out line st status var
-  if out="$(docker compose ps -a --format '{{.Service}}|{{.State}}|{{.Status}}' 2>/dev/null | tr -d '\r')"; then
-    DOCK_OK=1
-    while IFS='|' read -r svc st status; do
-      [ -z "$svc" ] && continue
-      var="${svc//-/_}"
-      if [ "$st" = "running" ]; then
-        DOCK_RUNNING=$((DOCK_RUNNING + 1))
-        if echo "$status" | grep -q 'unhealthy'; then
-          eval "D_SYM_${var}='!'; D_COL_${var}=\"\$C_RED\""
-        elif echo "$status" | grep -q 'starting'; then
-          eval "D_SYM_${var}='~'; D_COL_${var}=\"\$C_YELLOW\""
+  local sig_parts="" line st status var
+  if [ -f "$DOCK_RAW" ]; then
+    local status_flag
+    status_flag="$(head -n 1 "$DOCK_RAW" 2>/dev/null || echo "ERR")"
+    if [ "$status_flag" = "OK" ]; then
+      DOCK_OK=1
+      while IFS='|' read -r svc st status; do
+        [ -z "$svc" ] && continue
+        var="${svc//-/_}"
+        sig_parts="${sig_parts};${svc}=${st}=${status}"
+        if [ "$st" = "running" ]; then
+          DOCK_RUNNING=$((DOCK_RUNNING + 1))
+          if echo "$status" | grep -q 'unhealthy'; then
+            eval "D_SYM_${var}='!'; D_COL_${var}=\"\$C_RED\""
+          elif echo "$status" | grep -q 'starting'; then
+            eval "D_SYM_${var}='~'; D_COL_${var}=\"\$C_YELLOW\""
+          else
+            DOCK_HEALTHY=$((DOCK_HEALTHY + 1))
+            eval "D_SYM_${var}='●'; D_COL_${var}=\"\$C_GREEN\""
+          fi
         else
-          DOCK_HEALTHY=$((DOCK_HEALTHY + 1))
-          eval "D_SYM_${var}='●'; D_COL_${var}=\"\$C_GREEN\""
+          eval "D_SYM_${var}='✗'; D_COL_${var}=\"\$C_RED\""
         fi
+      done < <(tail -n +2 "$DOCK_RAW")
+    fi
+  fi
+  DOCK_SIG="${DOCK_OK}|${DOCK_HEALTHY}|${DOCK_RUNNING}|${sig_parts}"
+}
+
+fetch_dock_sync() {
+  local out
+  if out="$(docker compose ps -a --format '{{.Service}}|{{.State}}|{{.Status}}' 2>/dev/null | tr -d '\r')"; then
+    printf 'OK\n%s\n' "$out" > "$DOCK_RAW"
+  else
+    printf 'ERR\n' > "$DOCK_RAW"
+  fi
+  LAST_DOCK_POLL=$(date +%s)
+  parse_dock_raw
+}
+
+start_dock_probe_bg() {
+  if [ "$DOCK_BG_PID" -gt 0 ]; then
+    if kill -0 "$DOCK_BG_PID" 2>/dev/null; then
+      return
+    fi
+    wait "$DOCK_BG_PID" 2>/dev/null || true
+    DOCK_BG_PID=0
+    LAST_DOCK_POLL=$(date +%s)
+    local prev_sig="$LAST_DOCK_SIG"
+    parse_dock_raw
+    [ "$DOCK_SIG" != "$prev_sig" ] && update_dock_in_place
+    return
+  fi
+  local now
+  now=$(date +%s)
+  if [ $((now - LAST_DOCK_POLL)) -ge 2 ]; then
+    (
+      local out
+      if out="$(docker compose ps -a --format '{{.Service}}|{{.State}}|{{.Status}}' 2>/dev/null | tr -d '\r')"; then
+        printf 'OK\n%s\n' "$out" > "$TMP/dock.tmp" && mv "$TMP/dock.tmp" "$DOCK_RAW"
       else
-        eval "D_SYM_${var}='✗'; D_COL_${var}=\"\$C_RED\""
+        printf 'ERR\n' > "$TMP/dock.tmp" && mv "$TMP/dock.tmp" "$DOCK_RAW"
       fi
-    done <<< "$out"
+    ) &
+    DOCK_BG_PID=$!
+    LAST_DOCK_POLL="$now"
   fi
 }
 
@@ -159,34 +312,58 @@ print_badge() {
 }
 
 render_cluster_dock() {
-  fetch_cluster_dock_data
+  [ ! -f "$DOCK_RAW" ] && fetch_dock_sync || parse_dock_raw
+  LAST_DOCK_SIG="$DOCK_SIG"
   local title tcol bcol="$C_CYAN"
   if [ "$DOCK_OK" -eq 0 ]; then
-    title="CLUSTER INMERSO · DOCKER DESCONECTADO"; tcol="$C_RED"
+    title="MONITOR EN VIVO · DOCKER DESCONECTADO"; tcol="$C_RED"
   elif [ "$DOCK_HEALTHY" -eq 8 ]; then
-    title="CLUSTER INMERSO · 8/8 HEALTHY"; tcol="$C_GREEN"
+    title="MONITOR EN VIVO · 8/8 EN LINEA"; tcol="$C_GREEN"
   else
-    title="CLUSTER INMERSO · ${DOCK_HEALTHY}/8 HEALTHY · ${DOCK_RUNNING}/8 ACTIVOS"; tcol="$C_YELLOW"
+    title="MONITOR EN VIVO · ${DOCK_HEALTHY}/8 HEALTHY · ${DOCK_RUNNING}/8 ACTIVOS"; tcol="$C_YELLOW"
   fi
   local t=" $title "
-  local fill=$((75 - ${#t}))
+  local fill=$(( (UI_W - 3) - ${#t} ))
   [ "$fill" -lt 2 ] && fill=2
-  printf '%s┌─%s%s%s┐%s\n' "$bcol" "$tcol" "$t" "$bcol$(repeat_char '─' "$fill")" "$C_RESET"
+  printf '%s%s┌─%s%s%s┐%s%s\n' "$MARGIN" "$bcol" "$tcol" "$t" "$bcol$(repeat_char '─' "$fill")" "$C_RESET" "$CLR_EOL"
 
-  printf '%s│ %sEDGE ' "$bcol" "$C_DIM"
-  print_badge "gateway :8080" "api-gateway"; printf ' '
-  print_badge "eureka :8761" "eureka-server"; printf '  %sBD ' "$C_DIM"
-  print_badge "primary" "primary"; printf ' '
-  print_badge "rep1" "replica1"; printf ' '
-  print_badge "rep2" "replica2"; printf '  %s│%s\n' "$bcol" "$C_RESET"
+  if [ "$INNER_W" -ge 74 ]; then
+    local mid=$(( (INNER_W - 71) / 2 ))
+    [ "$mid" -lt 2 ] && mid=2
+    local rem1=$((INNER_W - (71 + mid)))
+    [ "$rem1" -lt 0 ] && rem1=0
+    printf '%s%s│ %sRED  ' "$MARGIN" "$bcol" "$C_DIM"
+    print_badge "gateway :8080" "api-gateway"; printf ' '
+    print_badge "eureka :8761" "eureka-server"; printf '%*s%sBD ' "$mid" "" "$C_DIM"
+    print_badge "primary" "primary"; printf ' '
+    print_badge "rep1" "replica1"; printf ' '
+    print_badge "rep2" "replica2"; printf '%*s %s│%s%s\n' "$rem1" "" "$bcol" "$C_RESET" "$CLR_EOL"
 
-  printf '%s│ %sAPPS ' "$bcol" "$C_DIM"
-  print_badge "cuentas-1 :8081" "ms-cuentas-1"; printf ' '
-  print_badge "cuentas-2 :8082" "ms-cuentas-2"; printf ' '
-  print_badge "transacciones :8083" "ms-transacciones"
-  printf '       %s│%s\n' "$bcol" "$C_RESET"
+    local rem2=$((INNER_W - 68))
+    [ "$rem2" -lt 0 ] && rem2=0
+    printf '%s%s│ %sAPPS ' "$MARGIN" "$bcol" "$C_DIM"
+    print_badge "cuentas-1 :8081" "ms-cuentas-1"; printf ' '
+    print_badge "cuentas-2 :8082" "ms-cuentas-2"; printf ' '
+    print_badge "transacciones :8083" "ms-transacciones"
+    printf '%*s %s│%s%s\n' "$rem2" "" "$bcol" "$C_RESET" "$CLR_EOL"
+  else
+    local rem1=$((INNER_W - 57)); [ "$rem1" -lt 0 ] && rem1=0
+    printf '%s%s│ %sRED  ' "$MARGIN" "$bcol" "$C_DIM"
+    print_badge "gw" "api-gateway"; printf ' '
+    print_badge "eureka" "eureka-server"; printf '   %sBD ' "$C_DIM"
+    print_badge "primary" "primary"; printf ' '
+    print_badge "rep1" "replica1"; printf ' '
+    print_badge "rep2" "replica2"; printf '%*s %s│%s%s\n' "$rem1" "" "$bcol" "$C_RESET" "$CLR_EOL"
 
-  printf '%s└%s┘%s\n' "$bcol" "$(repeat_char '─' 76)" "$C_RESET"
+    local rem2=$((INNER_W - 50)); [ "$rem2" -lt 0 ] && rem2=0
+    printf '%s%s│ %sAPPS ' "$MARGIN" "$bcol" "$C_DIM"
+    print_badge "cuentas-1" "ms-cuentas-1"; printf ' '
+    print_badge "cuentas-2" "ms-cuentas-2"; printf ' '
+    print_badge "transacciones" "ms-transacciones"
+    printf '%*s %s│%s%s\n' "$rem2" "" "$bcol" "$C_RESET" "$CLR_EOL"
+  fi
+
+  printf '%s%s└%s┘%s%s\n' "$MARGIN" "$bcol" "$(repeat_char '─' "$((UI_W - 2))")" "$C_RESET" "$CLR_EOL"
 }
 
 update_dock_in_place() {
@@ -198,28 +375,40 @@ update_dock_in_place() {
 
 slide_chrome() {
   local num="$1" active="$2" title="$3"
-  DOCK_ROW=5
   begin_frame
-  local labels=("[1:Arq]" "[2:Eur]" "[3:P2P]" "[4:Rep]" "[5:Fal]" "[6:Fin]")
+  DOCK_ROW=$((PAD_T + 5))
+  local labels tab_len bar_len=10
+  if [ "$INNER_W" -lt 70 ]; then
+    labels=("[1]" "[2]" "[3]" "[4]" "[5]" "[6]")
+    tab_len=23
+  else
+    labels=("[1:Arq]" "[2:Eur]" "[3:P2P]" "[4:Rep]" "[5:Fal]" "[6:Fin]")
+    tab_len=47
+  fi
+  [ "$INNER_W" -ge 88 ] && bar_len=14
   local right gap row2 i col
-  right="$(printf '%02d/15 %s' "$num" "$(get_progress_bar "$num" 15)")"
-  gap=$((74 - 47 - ${#right}))
+  right="$(printf '%02d/15 %s' "$num" "$(get_progress_bar "$num" 15 "$bar_len")")"
+  gap=$((INNER_W - tab_len - ${#right}))
   [ "$gap" -lt 1 ] && gap=1
-  row2="$(pad_fixed "► $title" 74)"
+  row2="$(pad_fixed "► $title" "$INNER_W")"
 
-  printf '%s╔%s╗%s\n' "$C_CYAN" "$(repeat_char '═' 76)" "$C_RESET"
-  printf '%s║ ' "$C_CYAN"
+  printf '%s%s╔%s╗%s%s\n' "$MARGIN" "$C_CYAN" "$(repeat_char '═' "$((UI_W - 2))")" "$C_RESET" "$CLR_EOL"
+  printf '%s%s║ ' "$MARGIN" "$C_CYAN"
   for i in 0 1 2 3 4 5; do
     col="$C_DIM"
     [ $((i + 1)) -eq "$active" ] && col="${C_BOLD}${C_YELLOW}"
     printf '%s%s%s' "$col" "${labels[$i]}" "$C_RESET"
     [ "$i" -lt 5 ] && printf ' '
   done
-  printf '%*s%s%s%s ║%s\n' "$gap" "" "$C_CYAN" "$right" "$C_CYAN" "$C_RESET"
-  printf '%s║ %s%s%s ║%s\n' "$C_CYAN" "${C_BOLD}${C_WHITE}" "$row2" "$C_CYAN" "$C_RESET"
-  printf '%s╚%s╝%s\n' "$C_CYAN" "$(repeat_char '═' 76)" "$C_RESET"
+  printf '%*s%s%s%s ║%s%s\n' "$gap" "" "$C_CYAN" "$right" "$C_CYAN" "$C_RESET" "$CLR_EOL"
+  printf '%s%s║ %s%s%s ║%s%s\n' "$MARGIN" "$C_CYAN" "${C_BOLD}${C_WHITE}" "$row2" "$C_CYAN" "$C_RESET" "$CLR_EOL"
+  printf '%s%s╚%s╝%s%s\n' "$MARGIN" "$C_CYAN" "$(repeat_char '═' "$((UI_W - 2))")" "$C_RESET" "$CLR_EOL"
 
   render_cluster_dock
+  if [ -t 1 ] && [ "$LAST_SCREEN_ID" != "S${num}" ]; then
+    printf '\033[J'
+  fi
+  LAST_SCREEN_ID="S${num}"
 }
 
 open_eureka() {
@@ -270,15 +459,20 @@ parse_key_char() {
 }
 
 read_slide_key_live() {
-  local live="${1:-1}" k=""
+  local live="${1:-1}" k="" tout=1
+  [ "${BASH_VERSINFO[0]:-3}" -ge 4 ] && tout="0.2"
   if [ ! -t 0 ]; then ACT="QUIT"; return; fi
   while true; do
+    if [ "$RESIZED" -eq 1 ]; then
+      ACT="RESIZE"; return
+    fi
     if [ "$live" -eq 1 ]; then
-      if IFS= read -rsn1 -t 3 k; then
+      if IFS= read -rsn1 -t "$tout" k; then
         parse_key_char "$k"
         return
       else
-        update_dock_in_place
+        if [ "$RESIZED" -eq 1 ]; then ACT="RESIZE"; return; fi
+        start_dock_probe_bg
       fi
     else
       IFS= read -rsn1 k || { ACT="QUIT"; return; }
@@ -290,19 +484,25 @@ read_slide_key_live() {
 
 wait_slide_footer() {
   local next_lbl="${1:-Siguiente}" allow_back="${2:-1}"
-  printf '%s%s%s\n' "$C_DIM" "$(repeat_char '─' 78)" "$C_RESET"
+  write_divider
   if [ "$allow_back" -eq 1 ]; then
-    printf '  %s[ESPACIO/→] %s   [←/Backspace] Anterior%s\n' "${C_BOLD}${C_GREEN}" "$next_lbl" "$C_RESET"
+    local nav_line="  [ESPACIO/→] ${next_lbl}   [←/Backspace] Anterior"
+    if [ "${#nav_line}" -gt "$UI_W" ]; then
+      nav_line="  [ESPACIO/→] ${next_lbl}   [←] Anterior"
+    fi
+    ui_line "${C_BOLD}${C_GREEN}" "$nav_line"
   else
-    printf '  %s[ESPACIO/→] %s%s\n' "${C_BOLD}${C_GREEN}" "$next_lbl" "$C_RESET"
+    ui_line "${C_BOLD}${C_GREEN}" "  [ESPACIO/→] $next_lbl"
   fi
-  printf '  %s[1-6] Seccion   [R] Actualizar   [B] Eureka   [U] Utilidades   [Q] Salir%s\n' "$C_DIM" "$C_RESET"
+  local help_line="  [1-6] Seccion   [R] Actualizar   [B] Eureka   [U] Utilidades   [Q] Salir"
+  [ "$UI_W" -lt 76 ] && help_line="  [1-6] Sec   [R] Re-ejec   [B] Eureka   [U] Utils   [Q] Salir"
+  ui_line "$C_DIM" "$help_line"
   end_frame
   while true; do
     read_slide_key_live 1
     case "$ACT" in
       EUREKA)       open_eureka ;;
-      DOCK_REFRESH) update_dock_in_place ;;
+      DOCK_REFRESH) fetch_dock_sync; update_dock_in_place ;;
       *)            return ;;
     esac
   done
@@ -329,13 +529,56 @@ ensure_env() {
   if [ ! -f "$REPO_DIR/.env" ]; then
     if [ -f "$REPO_DIR/.env.example" ]; then
       cp "$REPO_DIR/.env.example" "$REPO_DIR/.env"
-      printf '  %s[OK] Archivo .env creado desde .env.example.%s\n' "$C_GREEN" "$C_RESET"
+      printf '%s  %s[OK] Archivo .env creado desde .env.example.%s\n' "$MARGIN" "$C_GREEN" "$C_RESET"
       return 0
     fi
-    printf '  %s[ERROR] No existe .env ni .env.example.%s\n' "$C_RED" "$C_RESET"
+    printf '%s  %s[ERROR] No existe .env ni .env.example.%s\n' "$MARGIN" "$C_RED" "$C_RESET"
     return 1
   fi
   return 0
+}
+
+write_three_col_cards() {
+  local t1="$1" t2="$2" t3="$3" c1="$4" c2="$5" c3="$6"
+  shift 6
+  local cw_base=$(( (UI_W - 2) / 3 ))
+  local rem=$(( (UI_W - 2) - cw_base * 3 ))
+  local cw0=$cw_base cw1=$cw_base cw2=$cw_base
+  [ "$rem" -ge 1 ] && cw0=$((cw0 + 1))
+  [ "$rem" -ge 2 ] && cw1=$((cw1 + 1))
+  local cws=($cw0 $cw1 $cw2)
+  local titles=("$t1" "$t2" "$t3")
+  local i t cw ci fill maxt
+
+  printf '%s' "$MARGIN"
+  for i in 0 1 2; do
+    cw="${cws[$i]}"; maxt=$((cw - 3))
+    t=" ${titles[$i]} "
+    [ "${#t}" -gt "$maxt" ] && t="${t:0:$maxt}"
+    fill=$(( (cw - 3) - ${#t} )); [ "$fill" -lt 1 ] && fill=1
+    printf '%s┌─%s%s┐%s' "$C_CYAN" "$t" "$(repeat_char '─' "$fill")" "$C_RESET"
+    [ "$i" -lt 2 ] && printf ' '
+  done
+  printf '%s\n' "$CLR_EOL"
+
+  local row f1 f2 f3
+  for row in "$@"; do
+    f1="$(echo "$row" | cut -d'|' -f1)"
+    f2="$(echo "$row" | cut -d'|' -f2)"
+    f3="$(echo "$row" | cut -d'|' -f3)"
+    printf '%s%s│%s%s%s│ %s│%s%s%s│ %s│%s%s%s│%s%s\n' \
+      "$MARGIN" "$c1" "$C_WHITE" "$(pad_fixed "$f1" "$((cw0 - 2))")" "$c1" \
+      "$c2" "$C_WHITE" "$(pad_fixed "$f2" "$((cw1 - 2))")" "$c2" \
+      "$c3" "$C_WHITE" "$(pad_fixed "$f3" "$((cw2 - 2))")" "$c3" "$C_RESET" "$CLR_EOL"
+  done
+
+  printf '%s%s' "$MARGIN" "$C_DIM"
+  for i in 0 1 2; do
+    ci=$((cws[i] - 2))
+    printf '└%s┘' "$(repeat_char '─' "$ci")"
+    [ "$i" -lt 2 ] && printf ' '
+  done
+  printf '%s%s\n' "$C_RESET" "$CLR_EOL"
 }
 
 extract_transfer_fields() {
@@ -415,12 +658,14 @@ PY
 # --- Panel de Utilidades ---
 
 show_clean_prep() {
+  LAST_SCREEN_ID="PREP"
   begin_frame 1
-  printf '%s╔%s╗%s\n' "$C_YELLOW" "$(repeat_char '═' 76)" "$C_RESET"
-  printf '%s║ %s%s%s ║%s\n' "$C_YELLOW" "$C_YELLOW" "$(pad_fixed "REINICIO LIMPIO DEL ENTORNO (down -v + up -d --build)" 74)" "$C_YELLOW" "$C_RESET"
-  printf '%s╚%s╝%s\n\n' "$C_YELLOW" "$(repeat_char '═' 76)" "$C_RESET"
+  printf '%s%s╔%s╗%s%s\n' "$MARGIN" "$C_YELLOW" "$(repeat_char '═' "$((UI_W - 2))")" "$C_RESET" "$CLR_EOL"
+  printf '%s%s║ %s%s%s ║%s%s\n' "$MARGIN" "$C_YELLOW" "$C_YELLOW" "$(pad_fixed "REINICIO LIMPIO DEL ENTORNO (down -v + up -d --build)" "$INNER_W")" "$C_YELLOW" "$C_RESET" "$CLR_EOL"
+  printf '%s%s╚%s╝%s%s\n' "$MARGIN" "$C_YELLOW" "$(repeat_char '═' "$((UI_W - 2))")" "$C_RESET" "$CLR_EOL"
+  ui_blank
   ensure_env || { wait_slide_footer "Volver" 0; FIRST_FRAME=1; return; }
-  printf '  %s$ docker compose down -v && docker compose up -d --build%s\n' "$C_CYAN" "$C_RESET"
+  ui_line "$C_CYAN" "  \$ docker compose down -v && docker compose up -d --build"
   docker compose down -v
   docker compose up -d --build || {
     printf '\n  %s[ERROR] docker compose up fallo.%s\n' "$C_RED" "$C_RESET"
@@ -432,7 +677,7 @@ show_clean_prep() {
   while true; do
     now=$(date +%s); elapsed=$((now - start_t))
     [ "$elapsed" -ge 240 ] && break
-    fetch_cluster_dock_data
+    fetch_dock_sync
     printf '\r  %s[%3ds] Healthy: %s/8   %s' "$C_CYAN" "$elapsed" "$DOCK_HEALTHY" "$C_RESET"
     if [ "$DOCK_HEALTHY" -ge 8 ]; then
       printf '\n  %s[OK] Los 8 contenedores estan healthy!%s\n' "$C_GREEN" "$C_RESET"
@@ -442,32 +687,34 @@ show_clean_prep() {
   done
   open_eureka
   printf '  %s[OK] Eureka abierto en %s%s\n' "$C_GREEN" "$EUREKA" "$C_RESET"
-  CACHE_TX_OK_FILE=""
-  CACHE_TX_ERR_FILE=""
+  CACHE_TX_OK_FILE=""; CACHE_TX_ERR_FILE=""
   wait_slide_footer "Volver al panel" 0
   FIRST_FRAME=1
 }
 
 show_utils_panel() {
   FIRST_FRAME=1
+  LAST_SCREEN_ID="UTILS"
   while true; do
-    DOCK_ROW=4
     begin_frame
-    printf '%s╔%s╗%s\n' "$C_CYAN" "$(repeat_char '═' 76)" "$C_RESET"
-    printf '%s║ %s%s%s ║%s\n' "$C_CYAN" "$C_CYAN" "$(pad_fixed "UTILIDADES DEL ENTORNO Y VERIFICACION" 74)" "$C_CYAN" "$C_RESET"
-    printf '%s╚%s╝%s\n' "$C_CYAN" "$(repeat_char '═' 76)" "$C_RESET"
+    DOCK_ROW=$((PAD_T + 4))
+    printf '%s%s╔%s╗%s%s\n' "$MARGIN" "$C_CYAN" "$(repeat_char '═' "$((UI_W - 2))")" "$C_RESET" "$CLR_EOL"
+    printf '%s%s║ %s%s%s ║%s%s\n' "$MARGIN" "$C_CYAN" "$C_CYAN" "$(pad_fixed "UTILIDADES DEL ENTORNO Y VERIFICACION" "$INNER_W")" "$C_CYAN" "$C_RESET" "$CLR_EOL"
+    printf '%s%s╚%s╝%s%s\n' "$MARGIN" "$C_CYAN" "$(repeat_char '═' "$((UI_W - 2))")" "$C_RESET" "$CLR_EOL"
     render_cluster_dock
 
-    printf '\n'
-    [ ! -f "$REPO_DIR/.env" ] && printf '  %s[AVISO] Falta .env en el repositorio (pulsa [C] o [P]).%s\n' "$C_YELLOW" "$C_RESET"
+    ui_blank
+    if [ ! -f "$REPO_DIR/.env" ]; then
+      ui_line "$C_YELLOW" "  [AVISO] Falta .env en el repositorio (pulsa [C] o [P])."
+    fi
     local sinfo
     if sinfo="$(get_saldo_line | tr -d '\r')"; then
       local s c l col="$C_GREEN"
       s="$(echo "$sinfo" | cut -d'|' -f1)"; c="$(echo "$sinfo" | cut -d'|' -f2)"; l="$(echo "$sinfo" | cut -d'|' -f3)"
       awk -v v="${c:-0}" 'BEGIN{exit !(v+0 > 0)}' && col="$C_YELLOW"
-      printf '  %sCuenta %s: saldo=$%s | consumidoHoy=$%s / $%s%s\n' "$col" "$ORIGEN" "$s" "$c" "$l" "$C_RESET"
+      ui_line "$col" "  Cuenta $ORIGEN: saldo=\$$s | consumidoHoy=\$$c / \$$l"
     fi
-    printf '\n'
+    ui_blank
     box_top "ACCIONES DISPONIBLES" "$C_CYAN"
     box_line "[P] Reinicio limpio (down -v + up -d --build + abrir Eureka)" "$C_YELLOW" "$C_CYAN"
     box_line "[S] Arrancar contenedores detenidos (docker compose start)" "$C_WHITE" "$C_CYAN"
@@ -481,10 +728,11 @@ show_utils_panel() {
 
     read_slide_key_live 1
     case "$ACT" in
+      RESIZE)       continue ;;
       PREP)         show_clean_prep ;;
-      STARTALL)     begin_frame 1; ensure_env || true; docker compose start; wait_slide_footer "Volver" 0; FIRST_FRAME=1 ;;
+      STARTALL)     begin_frame 1; ensure_env || true; docker compose start; fetch_dock_sync; wait_slide_footer "Volver" 0; FIRST_FRAME=1 ;;
       EUREKA)       open_eureka ;;
-      DOCK_REFRESH) update_dock_in_place ;;
+      DOCK_REFRESH) fetch_dock_sync; update_dock_in_place ;;
       ENV)          ensure_env; sleep 1 ;;
       SUITE)
         begin_frame 1
@@ -503,37 +751,76 @@ show_utils_panel() {
 
 slide_01() {
   slide_chrome 1 1 "Arquitectura del Sistema · 8 Contenedores Docker"
-  printf '\n'
+  ui_blank
   box_top "FLUJO Y TOPOLOGIA DE RED (wallet-net)" "$C_CYAN"
-  box_line "Cliente ─:8080─▶ [api-gateway] ◀──registro/latido 5s──▶ [eureka :8761]" "$C_CYAN" "$C_CYAN"
-  box_line "                      │ lb:// Round-Robin" "$C_DIM" "$C_CYAN"
-  box_line "        ┌─────────────┼─────────────┐" "$C_DIM" "$C_CYAN"
-  box_line "        ▼             ▼             ▼" "$C_DIM" "$C_CYAN"
-  box_line " [ms-cuentas-1] [ms-cuentas-2] [ms-transacciones]  (esquemas aislados:" "$C_GREEN" "$C_CYAN"
-  box_line "     :8081          :8082            :8083          cuentas_db / tx_db)" "$C_GREEN" "$C_CYAN"
-  box_line "        └─────────────┬─────────────┘  Enrutador JDBC (@UsarNodo)" "$C_MAGENTA" "$C_CYAN"
-  box_line "     Escritura / RYOW │         Lecturas Ordinarias" "$C_DIM" "$C_CYAN"
-  box_line "                      ▼" "$C_DIM" "$C_CYAN"
-  box_line "       [primary :5432 R/W] ══WAL══▶ [replica1 :5433] + [replica2 :5434]" "$C_BLUE" "$C_CYAN"
+  if [ "$INNER_W" -ge 71 ]; then
+    local pad=""
+    [ "$INNER_W" -ge 86 ] && pad="      "
+    box_line "${pad}Cliente ─:8080─► [api-gateway] ◄──registro/latido 5s──► [eureka :8761]" "$C_CYAN" "$C_CYAN"
+    box_line "${pad}                      │ lb:// Round-Robin" "$C_DIM" "$C_CYAN"
+    box_line "${pad}        ┌─────────────┼─────────────┐" "$C_DIM" "$C_CYAN"
+    box_line "${pad}        ▼             ▼             ▼" "$C_DIM" "$C_CYAN"
+    box_line "${pad} [ms-cuentas-1] [ms-cuentas-2] [ms-transacciones]  (esquemas aislados:" "$C_GREEN" "$C_CYAN"
+    box_line "${pad}     :8081          :8082            :8083          cuentas_db / tx_db)" "$C_GREEN" "$C_CYAN"
+    box_line "${pad}        └─────────────┬─────────────┘  Enrutador JDBC (@UsarNodo)" "$C_MAGENTA" "$C_CYAN"
+    box_line "${pad}     Escritura / RYOW │         Lecturas Ordinarias" "$C_DIM" "$C_CYAN"
+    box_line "${pad}                      ▼" "$C_DIM" "$C_CYAN"
+    box_line "${pad}       [primary :5432 R/W] ══WAL══► [replica1 :5433] + [replica2 :5434]" "$C_BLUE" "$C_CYAN"
+  else
+    box_line "Cliente :8080►[gateway]◄─5s─►[eureka :8761]" "$C_CYAN" "$C_CYAN"
+    box_line "                  │ lb:// Round-Robin" "$C_DIM" "$C_CYAN"
+    box_line "       ┌──────────┼──────────┐" "$C_DIM" "$C_CYAN"
+    box_line "       ▼          ▼          ▼" "$C_DIM" "$C_CYAN"
+    box_line " [cuentas-1] [cuentas-2] [ms-tx]  (cuentas_db / tx_db)" "$C_GREEN" "$C_CYAN"
+    box_line "     :8081      :8082     :8083" "$C_GREEN" "$C_CYAN"
+    box_line "       └──────────┬──────────┘  @UsarNodo JDBC" "$C_MAGENTA" "$C_CYAN"
+    box_line "   Write / RYOW   │    Lecturas" "$C_DIM" "$C_CYAN"
+    box_line "                  ▼" "$C_DIM" "$C_CYAN"
+    box_line " [primary:5432]═WAL═►[rep1:5433]+[rep2:5434]" "$C_BLUE" "$C_CYAN"
+  fi
   box_bottom "$C_CYAN"
+  if [ "$INNER_W" -ge 70 ]; then
+    ui_line "$C_DIM" "  ● Gateway balancea HTTP; Postgres separa escrituras y lecturas."
+  else
+    ui_line "$C_DIM" "  ● Gateway balancea HTTP; Postgres separa write/read."
+  fi
   wait_slide_footer "Detalle del clúster"
 }
 
 slide_02() {
+  local use_cache="${1:-0}"
   slide_chrome 2 1 "Clúster Docker Compose · Estado de Servicios"
-  printf '\n'
+  ui_blank
+  if [ "$use_cache" -eq 0 ] || [ "$CACHE_PS_READY" -eq 0 ]; then
+    if docker compose ps -a --format '{{.Name}}|{{.Service}}|{{.Status}}|{{.Ports}}' > "$TMP/ps_raw.txt" 2>/dev/null; then
+      CACHE_PS_READY=1
+    else
+      : > "$TMP/ps_raw.txt"
+      CACHE_PS_READY=0
+    fi
+  fi
   box_top "TELEMETRIA DE CONTENEDORES (docker compose ps)" "$C_CYAN"
-  if docker compose ps --format 'table {{.Name}}\t{{.Service}}\t{{.Status}}\t{{.Ports}}' >"$TMP/ps.txt" 2>/dev/null; then
-    while IFS= read -r line; do
-      [ -z "$line" ] && continue
-      if echo "$line" | grep -q 'healthy'; then
-        box_line "$line" "$C_GREEN" "$C_CYAN"
-      elif echo "$line" | grep -q '^NAME'; then
-        box_line "$line" "$C_CYAN" "$C_CYAN"
+  if [ "$CACHE_PS_READY" -eq 1 ] && [ -s "$TMP/ps_raw.txt" ]; then
+    local show_ports=0
+    [ "$INNER_W" -ge 72 ] && show_ports=1
+    if [ "$show_ports" -eq 1 ]; then
+      box_line "$(printf '%-18s %-16s %-23s %s' "CONTENEDOR" "SERVICIO" "ESTADO" "PUERTOS")" "$C_CYAN" "$C_CYAN"
+    else
+      box_line "$(printf '%-18s %-16s %s' "CONTENEDOR" "SERVICIO" "ESTADO")" "$C_CYAN" "$C_CYAN"
+    fi
+    while IFS='|' read -r cname svc status ports; do
+      [ -z "$cname" ] && continue
+      status="${status//About an hour/~1h}"
+      status="${status//(health: starting)/(starting)}"
+      status="${status//Less than a second/<1s}"
+      ports="$(echo "$ports" | sed -E 's/0\.0\.0\.0://g; s/\[::\]:[0-9]+->[0-9]+\/tcp,? *//g; s/\/tcp//g')"
+      local col="$C_YELLOW"; echo "$status" | grep -q 'healthy' && col="$C_GREEN"
+      if [ "$show_ports" -eq 1 ]; then
+        box_line "$(printf '%-18s %-16s %-23s %s' "$cname" "$svc" "$status" "$ports")" "$col" "$C_CYAN"
       else
-        box_line "$line" "$C_YELLOW" "$C_CYAN"
+        box_line "$(printf '%-18s %-16s %s' "$cname" "$svc" "$status")" "$col" "$C_CYAN"
       fi
-    done <"$TMP/ps.txt"
+    done < <(tr -d '\r' < "$TMP/ps_raw.txt")
   else
     box_line "No se pudo consultar docker compose (verifica Docker)." "$C_RED" "$C_CYAN"
   fi
@@ -542,82 +829,121 @@ slide_02() {
 }
 
 slide_03() {
+  local use_cache="${1:-0}"
   slide_chrome 3 2 "Descubrimiento Dinámico con Netflix Eureka"
-  printf '\n'
+  ui_blank
   box_top "ARQUITECTURA DE DESCUBRIMIENTO" "$C_CYAN"
-  box_line "● Auto-registro al arrancar y latido (heartbeat) cada 5 segundos." "$C_WHITE" "$C_CYAN"
-  box_line "● API Gateway resuelve por nombre logico (lb://ms-cuentas), sin IPs fijas." "$C_WHITE" "$C_CYAN"
+  box_line "● Auto-registro al iniciar y latido (heartbeat) cada 5s." "$C_WHITE" "$C_CYAN"
+  box_line "● Gateway resuelve via lb://ms-cuentas, sin IPs fijas." "$C_WHITE" "$C_CYAN"
   box_bottom "$C_CYAN"
-  printf '\n'
+  ui_blank
+  if [ "$use_cache" -eq 0 ] || [ -z "$CACHE_EUREKA_CODE" ]; then
+    CACHE_EUREKA_CODE="$(api_req GET "$EUREKA/eureka/apps" "" 5)"
+    cp "$BODY_FILE" "$TMP/eureka_cache.json" 2>/dev/null || true
+  fi
   box_top "REGISTRO EUREKA EN VIVO (:8761/eureka/apps)" "$C_GREEN"
-  local code
-  code="$(api_req GET "$EUREKA/eureka/apps" "" 5)"
-  if [ "$code" = "200" ]; then
+  if [ "$CACHE_EUREKA_CODE" = "200" ]; then
     case "$JSON_TOOL" in
       jq)
-        jq -r '.applications.application[] | "\(.name)|\([.instance[] | "\(.instanceId) [\(.status)]"] | join("  ,  "))"' "$BODY_FILE" 2>/dev/null | \
-          while IFS='|' read -r name insts; do
-            local col="$C_CYAN"; [ "$name" = "MS-CUENTAS" ] && col="$C_GREEN"
-            box_line "$(printf '%-17s -> %s' "$name" "$insts")" "$col" "$C_GREEN"
+        jq -r '.applications.application[] | .name as $n | (if (.instance|type)=="array" then .instance[] else .instance end) | "\($n)|\(.instanceId)|\(.status)"' "$TMP/eureka_cache.json" 2>/dev/null | {
+          prev=""
+          while IFS='|' read -r name iid st; do
+            iid="$(echo "$iid" | sed -E 's/:([0-9a-f]{6})[0-9a-f]{26}(:|$)/:\1\2/')"
+            local col="$C_CYAN" prefix="                    "
+            [ "$name" = "MS-CUENTAS" ] && col="$C_GREEN"
+            if [ "$name" != "$prev" ]; then
+              prefix="$(printf '%-16s -> ' "$name")"
+              prev="$name"
+            fi
+            box_line "${prefix}${iid} [${st}]" "$col" "$C_GREEN"
           done
+        }
         ;;
       python3|python)
-        "$JSON_TOOL" - "$BODY_FILE" <<'PY' | tr -d '\r' | while IFS='|' read -r name insts; do
-import json, sys
+        "$JSON_TOOL" - "$TMP/eureka_cache.json" <<'PY' | tr -d '\r' | {
+import json, re, sys
 try:
     d = json.load(open(sys.argv[1], encoding="utf-8"))
     for app in d.get("applications", {}).get("application", []):
+        name = app.get("name", "")
         insts = app.get("instance", [])
         if isinstance(insts, dict): insts = [insts]
-        s = "  ,  ".join(f"{i.get('instanceId')} [{i.get('status')}]" for i in insts)
-        print(f"{app.get('name', '')}|{s}")
+        for idx, it in enumerate(insts):
+            iid = re.sub(r":([0-9a-f]{6})[0-9a-f]{26}(?=:|$)", r":\1", str(it.get("instanceId", "")))
+            prefix = f"{name:<16} -> " if idx == 0 else " " * 20
+            print(f"{name}|{prefix}{iid} [{it.get('status', '')}]")
 except Exception:
     pass
 PY
-          local col="$C_CYAN"; [ "$name" = "MS-CUENTAS" ] && col="$C_GREEN"
-          box_line "$(printf '%-17s -> %s' "$name" "$insts")" "$col" "$C_GREEN"
-        done
+          while IFS='|' read -r name line; do
+            local col="$C_CYAN"; [ "$name" = "MS-CUENTAS" ] && col="$C_GREEN"
+            box_line "$line" "$col" "$C_GREEN"
+          done
+        }
         ;;
       *) box_line "Respuesta Eureka OK (HTTP 200)." "$C_GREEN" "$C_GREEN" ;;
     esac
   else
-    box_line "No responde Eureka en $EUREKA (HTTP $code)." "$C_RED" "$C_GREEN"
+    box_line "No responde Eureka en $EUREKA (HTTP $CACHE_EUREKA_CODE)." "$C_RED" "$C_GREEN"
   fi
   box_bottom "$C_GREEN"
   wait_slide_footer "Balanceo HTTP Round Robin"
 }
 
 slide_04() {
+  local use_cache="${1:-0}"
   slide_chrome 4 2 "Balanceo de Carga HTTP · Round Robin"
-  printf '\n  %s20 peticiones consecutivas a GET %s/api/cuentas/instancia%s\n\n' "$C_CYAN" "$GATEWAY" "$C_RESET"
-  : > "$TMP/balanceo.txt"
-  local i code inst ok_cnt=0
-  for i in $(seq 1 20); do
-    code="$(api_req GET "$GATEWAY/api/cuentas/instancia" "" 5)"
-    [ "$code" = "200" ] && ok_cnt=$((ok_cnt + 1))
-    inst="$(get_header "X-Service-Instance")"; [ -z "$inst" ] && inst="sin-cabecera"
-    printf '%s %s\n' "$code" "$inst" >> "$TMP/balanceo.txt"
-  done
+  ui_blank
+  if [ "$INNER_W" -ge 64 ]; then
+    ui_line "$C_CYAN" "  20 peticiones a GET $GATEWAY/api/cuentas/instancia"
+  else
+    ui_line "$C_CYAN" "  20x GET /api/cuentas/instancia"
+  fi
+  ui_blank
+  if [ "$use_cache" -eq 0 ] || [ "$CACHE_BAL_READY" -eq 0 ]; then
+    : > "$TMP/balanceo.txt"
+    local i code inst ok_cnt=0
+    for i in $(seq 1 20); do
+      code="$(api_req GET "$GATEWAY/api/cuentas/instancia" "" 5)"
+      [ "$code" = "200" ] && ok_cnt=$((ok_cnt + 1))
+      inst="$(get_header "X-Service-Instance")"; [ -z "$inst" ] && inst="sin-cabecera"
+      printf '%s %s\n' "$code" "$inst" >> "$TMP/balanceo.txt"
+    done
+    CACHE_BAL_OK="$ok_cnt"
+    CACHE_BAL_READY=1
+  fi
+  local bar_w=$((INNER_W - 42))
+  [ "$bar_w" -gt 30 ] && bar_w=30
+  [ "$bar_w" -lt 8 ] && bar_w=8
   box_top "DISTRIBUCION POR INSTANCIA" "$C_GREEN"
   sort "$TMP/balanceo.txt" | uniq -c | while read -r cnt code inst; do
     local pct=$(( (cnt * 100) / 20 ))
-    local filled=$((cnt > 20 ? 20 : cnt))
+    local filled=$(( (cnt * bar_w + 10) / 20 )); [ "$filled" -gt "$bar_w" ] && filled="$bar_w"
     local bar_str col="$C_GREEN"
-    bar_str="$(repeat_char '█' "$filled")$(repeat_char '░' "$((20 - filled))")"
+    bar_str="$(repeat_char '█' "$filled")$(repeat_char '░' "$((bar_w - filled))")"
     [ "$code" != "200" ] && col="$C_RED"
     echo "$inst" | grep -q 'ms-cuentas-2' && [ "$code" = "200" ] && col="$C_CYAN"
     box_line "$(printf '%-20s [%s]  %s  %2d/20 (%3d%%)' "$inst" "$code" "$bar_str" "$cnt" "$pct")" "$col" "$C_GREEN"
   done
   box_bottom "$C_GREEN"
-  local pcol="$C_GREEN"; [ "$ok_cnt" -ne 20 ] && pcol="$C_RED"
-  printf '  %s[ RESULTADO: %d/20 RESPUESTAS 200 OK · REPARTO ROUND ROBIN ]%s\n' "$pcol" "$ok_cnt" "$C_RESET"
+  local err_cnt=$((20 - CACHE_BAL_OK))
+  local pcol="$C_GREEN"; [ "$err_cnt" -ne 0 ] && pcol="$C_RED"
+  ui_line "$pcol" "  [ RESULTADO: $CACHE_BAL_OK/20 OK · ERRORES: $err_cnt · REPARTO ROUND ROBIN ]"
   wait_slide_footer "3. Comunicación entre servicios"
 }
 
 slide_05() {
   local use_cache="${1:-0}" code
   slide_chrome 5 3 "Orquestación P2P entre Microservicios · Transferencia"
-  printf '\n  %sCliente ─POST :8080─▶ [ms-transacciones :8083] ─Eureka─▶ [ms-cuentas] ─ACID─▶ PRIMARY%s\n\n' "$C_CYAN" "$C_RESET"
+  ui_blank
+  local flow="  POST :8080 ─► ms-transacciones ─► ms-cuentas ─ACID─► PRIMARY"
+  if [ "$INNER_W" -ge 88 ]; then
+    flow="  Cliente ─POST :8080─► [ms-transacciones :8083] ─Eureka─► [ms-cuentas] ─ACID─► PRIMARY"
+  elif [ "$INNER_W" -lt 66 ]; then
+    flow="  POST :8080 ► ms-tx ► ms-cuentas ► PRIMARY"
+  fi
+  ui_line "$C_CYAN" "$flow"
+  ui_blank
 
   if [ "$use_cache" -eq 0 ] || [ -z "$CACHE_TX_OK_FILE" ] || [ ! -f "$CACHE_TX_OK_FILE" ]; then
     local payload="{\"celularOrigen\":\"$ORIGEN\",\"celularDestino\":\"$DESTINO\",\"monto\":25,\"motivo\":\"Transferencia P2P\"}"
@@ -636,22 +962,37 @@ slide_05() {
   [ "$nbd" != "-" ] && LAST_TX_NODO="$nbd"
   [ "$cod" != "-" ] && LAST_TX_CODIGO="$cod"
 
+  local nbd_disp="$nbd" nbd_lbl="Nodo Base de Datos : "
+  if [ "$INNER_W" -lt 66 ]; then
+    nbd_disp="${nbd//recovery=/rec=}"
+    nbd_lbl="Nodo BD            : "
+  fi
+
   box_top "COMPROBANTE DE TRANSFERENCIA  [ HTTP $code ]" "$bcol"
   box_line "Estado / Mensaje   : $msg" "$bcol" "$bcol"
-  box_line "Comprobante        : $cod       Monto: \$25.00 ($ORIGEN -> $DESTINO)" "$C_WHITE" "$bcol"
-  box_line "Nuevo Saldo Origen : \$$sal" "$C_WHITE" "$bcol"
-  box_line "Instancia Cuentas  : $ic  (resuelta via Eureka)" "$C_CYAN" "$bcol"
-  box_line "Nodo Base de Datos : $nbd" "$C_YELLOW" "$bcol"
+  box_line "Comprobante        : $cod  (Monto: \$25.00)" "$C_WHITE" "$bcol"
+  box_line "Saldo Origen Post. : \$$sal  ($ORIGEN -> $DESTINO)" "$C_WHITE" "$bcol"
+  box_line "Instancia Cuentas  : $ic" "$C_CYAN" "$bcol"
+  box_line "${nbd_lbl}${nbd_disp}" "$C_YELLOW" "$bcol"
   box_line "Politica Enrutado  : $pol" "$C_WHITE" "$bcol"
   box_bottom "$bcol"
-  printf '  %s● Debito y credito ejecutados en una sola transaccion ACID con bloqueo ordenado.%s\n' "$C_DIM" "$C_RESET"
-  wait_slide_footer "Validación de saldo insuficiente"
+  local acid="  ● Debito y credito en una sola transaccion ACID con bloqueo ordenado."
+  [ "$INNER_W" -lt 68 ] && acid="  ● Debito/credito en 1 transaccion ACID con bloqueo ordenado."
+  ui_line "$C_DIM" "$acid"
+  wait_slide_footer "Validación saldo insuficiente"
 }
 
 slide_06() {
   local use_cache="${1:-0}" code
   slide_chrome 6 3 "Validación de Reglas de Negocio · Error Controlado"
-  printf '\n  %sEscritura previa (%s) -> %s%s\n\n' "$C_CYAN" "$LAST_TX_CODIGO" "$LAST_TX_NODO" "$C_RESET"
+  ui_blank
+  local pnod="$(fmt_node_width "$LAST_TX_NODO")"
+  if [ "$INNER_W" -ge 74 ]; then
+    ui_line "$C_CYAN" "  Escritura previa ($LAST_TX_CODIGO) -> $pnod"
+  else
+    ui_line "$C_CYAN" "  Escritura ($LAST_TX_CODIGO) -> $pnod"
+  fi
+  ui_blank
 
   if [ "$use_cache" -eq 0 ] || [ -z "$CACHE_TX_ERR_FILE" ] || [ ! -f "$CACHE_TX_ERR_FILE" ]; then
     local payload="{\"celularOrigen\":\"$ORIGEN\",\"celularDestino\":\"$DESTINO\",\"monto\":9999,\"motivo\":\"Prueba limite\"}"
@@ -667,91 +1008,152 @@ slide_06() {
   local fields msg cod sal ic nbd pol
   fields="$(extract_transfer_fields "$CACHE_TX_ERR_FILE" | tr -d '\r')"
   IFS='|' read -r msg cod sal ic nbd pol <<< "$fields"
+  local mlbl="Mensaje devuelto   : "
+  [ "$INNER_W" -lt 72 ] && mlbl="Mensaje  : "
 
   box_top "RECHAZO CONTROLADO  [ HTTP $code ]" "$bcol"
-  box_line "Mensaje devuelto   : $msg" "$bcol" "$bcol"
+  box_line "${mlbl}${msg}" "$bcol" "$bcol"
   box_line "Monto solicitado   : \$9999.00  (supera saldo disponible)" "$C_WHITE" "$bcol"
   box_line "Integridad ACID    : Transaccion revertida; saldos intactos" "$C_GREEN" "$bcol"
-  box_line "Auditoria nodoBD   : $nbd" "$C_CYAN" "$bcol"
+  box_line "Auditoria nodoBD   : $(fmt_node_width "$nbd")" "$C_CYAN" "$bcol"
   box_bottom "$bcol"
   wait_slide_footer "4. Persistencia replicada"
 }
 
-render_lecturas_box() {
-  local bcol="${1:-$C_GREEN}"
-  : > "$TMP/lecturas.txt"
-  local i u code node fb ok_cnt=0 fb_cnt=0
+fetch_lecturas_data() {
+  local tag="$1" t0 t1
+  t0="$(now_ms)"
+  : > "$TMP/lect_${tag}.txt"
+  : > "$TMP/lect_errs_${tag}.txt"
+  local i u code node fb ok_cnt=0 fb_cnt=0 err_cnt=0
   for i in $(seq 1 10); do
     for u in "cuentas/$ORIGEN/contactos" "transacciones/historial/$ORIGEN"; do
       code="$(api_req GET "$GATEWAY/api/$u" "" 5)"
-      [ "$code" = "200" ] && ok_cnt=$((ok_cnt + 1))
+      if [ "$code" = "200" ]; then
+        ok_cnt=$((ok_cnt + 1))
+      else
+        err_cnt=$((err_cnt + 1))
+        printf 'HTTP %s\n' "$code" >> "$TMP/lect_errs_${tag}.txt"
+      fi
       node="$(get_header "X-Db-Node")"; [ -z "$node" ] && node="desconocido"
       fb="$(get_header "X-Db-Fallback")"; [ -z "$fb" ] && fb="false"
       [ "$fb" = "true" ] && fb_cnt=$((fb_cnt + 1))
-      printf '%s|%s|%s\n' "$code" "$node" "$fb" >> "$TMP/lecturas.txt"
+      printf '%s|%s|%s\n' "$code" "$node" "$fb" >> "$TMP/lect_${tag}.txt"
     done
   done
+  t1="$(now_ms)"
+  local err_detail="0"
+  [ "$err_cnt" -gt 0 ] && err_detail="$(sort "$TMP/lect_errs_${tag}.txt" | uniq -c | awk '{printf "%s %s x%s, ", $2, $3, $1}' | sed 's/, $//')"
+  printf '%s|%s|%s|%s|%s\n' "$ok_cnt" "$err_cnt" "$err_detail" "$fb_cnt" "$(fmt_ms_sec $((t1 - t0)))" > "$TMP/lect_meta_${tag}.txt"
+}
+
+fmt_node_width() {
+  local n="$1"
+  if [ "$INNER_W" -ge 72 ]; then
+    printf '%s' "$n"
+  else
+    printf '%s' "$n" | sed -E 's/\([^)]*recovery=([^)]+)\)/(rec=\1)/g; s/, */ /g'
+  fi
+}
+
+render_lecturas_from_cache() {
+  local tag="$1" bcol="${2:-$C_GREEN}"
+  local max_node=20 dn
+  while IFS='|' read -r _c _n _f; do
+    dn="$(fmt_node_width "$_n")"
+    [ "${#dn}" -gt "$max_node" ] && max_node="${#dn}"
+  done < "$TMP/lect_${tag}.txt"
+  local bar_w=$((INNER_W - 25 - max_node))
+  [ "$bar_w" -gt 18 ] && bar_w=18
+  [ "$bar_w" -lt 4 ] && bar_w=4
   box_top "20 LECTURAS ORDINARIAS (contactos + historial)" "$bcol"
-  sort "$TMP/lecturas.txt" | uniq -c | while read -r line; do
-    local cnt rest code node fb filled bar_str col
+  sort "$TMP/lect_${tag}.txt" | uniq -c | while read -r line; do
+    local cnt rest code node dnode fb filled bar_str col
     cnt="$(echo "$line" | awk '{print $1}')"
     rest="$(echo "$line" | sed 's/^[[:space:]]*[0-9]*[[:space:]]*//')"
     code="$(echo "$rest" | cut -d'|' -f1)"
     node="$(echo "$rest" | cut -d'|' -f2)"
     fb="$(echo "$rest" | cut -d'|' -f3)"
-    filled=$((cnt > 12 ? 12 : cnt))
-    bar_str="$(repeat_char '█' "$filled")$(repeat_char '░' "$((12 - filled))")"
+    dnode="$(fmt_node_width "$node")"
+    filled=$(( (cnt * bar_w + 10) / 20 )); [ "$filled" -gt "$bar_w" ] && filled="$bar_w"
+    bar_str="$(repeat_char '█' "$filled")$(repeat_char '░' "$((bar_w - filled))")"
     col="$C_GREEN"; [ "$fb" = "true" ] && col="$C_YELLOW"; [ "$code" != "200" ] && col="$C_RED"
-    box_line "$(printf '%2d/20 [%s] %s  %s  fb=%s' "$cnt" "$code" "$bar_str" "$node" "$fb")" "$col" "$bcol"
+    box_line "$(printf '%2d/20 [%s] %s  %s  fb=%s' "$cnt" "$code" "$bar_str" "$dnode" "$fb")" "$col" "$bcol"
   done
   box_bottom "$bcol"
-  LECT_OK="$ok_cnt"
-  LECT_FB="$fb_cnt"
+  IFS='|' read -r LECT_OK LECT_ERR LECT_ERR_DETAIL LECT_FB LECT_SEC < "$TMP/lect_meta_${tag}.txt"
 }
 
 slide_07() {
+  local use_cache="${1:-0}"
   slide_chrome 7 4 "Enrutamiento de Base de Datos · Primario vs Réplicas"
-  printf '\n  %sEscrituras -> %s  |  Lecturas -> REPLICA_1 / REPLICA_2%s\n\n' "$C_CYAN" "$LAST_TX_NODO" "$C_RESET"
-  render_lecturas_box "$C_GREEN"
-  printf '  %s[ %s/20 LECTURAS 200 OK · REPARTO ROUND ROBIN EN REPLICAS (recovery=true) ]%s\n' "$C_GREEN" "$LECT_OK" "$C_RESET"
+  ui_blank
+  local wnod="$(fmt_node_width "$LAST_TX_NODO")"
+  if [ "$INNER_W" -ge 80 ]; then
+    ui_line "$C_CYAN" "  Escrituras -> $wnod  |  Lecturas -> REPLICA_1 / REPLICA_2"
+  else
+    ui_line "$C_CYAN" "  Write -> $wnod | Read -> REP1/REP2"
+  fi
+  ui_blank
+  if [ "$use_cache" -eq 0 ] || [ "$CACHE_LECT07_READY" -eq 0 ]; then
+    fetch_lecturas_data "07"
+    CACHE_LECT07_READY=1
+  fi
+  render_lecturas_from_cache "07" "$C_GREEN"
+  local col="$C_GREEN"; [ "$LECT_ERR" -gt 0 ] && col="$C_RED"
+  ui_line "$col" "  [ $LECT_OK/20 OK · ERRORES: $LECT_ERR_DETAIL · REPLICAS (recovery=true) · ${LECT_SEC}s ]"
   wait_slide_footer "Lectura crítica RYOW"
 }
 
 slide_08() {
+  local use_cache="${1:-0}"
   slide_chrome 8 4 "Consistencia Inmediata · Read-Your-Own-Writes (RYOW)"
-  printf '\n'
+  ui_blank
   box_top "ARQUITECTURA DE CONSISTENCIA" "$C_CYAN"
-  box_line "● Las replicas WAL pueden presentar retardo minimo tras una escritura." "$C_WHITE" "$C_CYAN"
-  box_line "● /saldo-critico enruta al PRIMARIO para garantizar lectura actualizada." "$C_WHITE" "$C_CYAN"
+  if [ "$INNER_W" -ge 68 ]; then
+    box_line "● Las replicas WAL pueden presentar retardo minimo tras escribir." "$C_WHITE" "$C_CYAN"
+    box_line "● /saldo-critico fuerza lectura al PRIMARIO (RYOW garantizado)." "$C_WHITE" "$C_CYAN"
+  else
+    box_line "● Replicas WAL pueden tener retardo minimo tras escribir." "$C_WHITE" "$C_CYAN"
+    box_line "● /saldo-critico fuerza lectura en PRIMARIO (RYOW)." "$C_WHITE" "$C_CYAN"
+  fi
   box_bottom "$C_CYAN"
-  printf '\n'
-  local code
-  code="$(api_req GET "$GATEWAY/api/cuentas/$ORIGEN/saldo-critico" "" 5)"
-  box_top "LECTURA CRITICA  [ GET /api/cuentas/$ORIGEN/saldo-critico ]" "$C_GREEN"
-  if [ "$code" = "200" ]; then
+  ui_blank
+  if [ "$use_cache" -eq 0 ] || [ -z "$CACHE_CRIT_CODE" ]; then
+    CACHE_CRIT_CODE="$(api_req GET "$GATEWAY/api/cuentas/$ORIGEN/saldo-critico" "" 5)"
+    cp "$BODY_FILE" "$TMP/crit_cache.json" 2>/dev/null || true
+  fi
+  local box_t8="LECTURA CRITICA  [ GET /api/cuentas/$ORIGEN/saldo-critico ]"
+  [ "$INNER_W" -lt 68 ] && box_t8="LECTURA CRITICA (GET /saldo-critico)"
+  box_top "$box_t8" "$C_GREEN"
+  if [ "$CACHE_CRIT_CODE" = "200" ]; then
     local fields sal nbd pol
-    fields="$(extract_critico_fields "$BODY_FILE" | tr -d '\r')"
+    fields="$(extract_critico_fields "$TMP/crit_cache.json" | tr -d '\r')"
     IFS='|' read -r sal nbd pol <<< "$fields"
     box_line "Saldo inmediato    : \$$sal" "$C_GREEN" "$C_GREEN"
-    box_line "Nodo Base de Datos : $nbd" "$C_CYAN" "$C_GREEN"
+    box_line "Nodo Base de Datos : $(fmt_node_width "$nbd")" "$C_CYAN" "$C_GREEN"
     box_line "Politica Enrutado  : $pol" "$C_YELLOW" "$C_GREEN"
   else
-    box_line "HTTP $code al consultar saldo-critico" "$C_RED" "$C_GREEN"
+    box_line "HTTP $CACHE_CRIT_CODE al consultar saldo-critico" "$C_RED" "$C_GREEN"
   fi
   box_bottom "$C_GREEN"
-  wait_slide_footer "5. Simulación de fallos (Instancia)"
+  wait_slide_footer "5. Simulación de fallos"
 }
 
 slide_09() {
   local use_cache="${1:-0}"
   slide_chrome 9 5 "Alta Disponibilidad HTTP · Caída de ms-cuentas-2"
 
-  if [ "$use_cache" -eq 1 ] && [ -n "$LAST_BURST_SUMMARY" ]; then
-    printf '\n'
-    box_top "RESUMEN DE ALTA DISPONIBILIDAD" "$C_CYAN"
-    box_line "$LAST_BURST_SUMMARY" "$C_GREEN" "$C_CYAN"
-    box_line "Eureka dio de baja la instancia y API Gateway reintento GET sin errores." "$C_WHITE" "$C_CYAN"
-    box_bottom "$C_CYAN"
+  if [ "$use_cache" -eq 1 ] && [ "${#LAST_BURST_LINES[@]}" -gt 0 ]; then
+    ui_blank
+    local rcol="$C_GREEN"
+    echo "${LAST_BURST_LINES[0]}" | grep -q 'Errores: 0$' || rcol="$C_YELLOW"
+    box_top "RESUMEN DE FALLO Y CONVERGENCIA" "$rcol"
+    local ln
+    for ln in "${LAST_BURST_LINES[@]}"; do
+      box_line "$ln" "$C_WHITE" "$rcol"
+    done
+    box_bottom "$rcol"
     wait_slide_footer "5b. Caída de réplica PostgreSQL"
     return
   fi
@@ -759,21 +1161,34 @@ slide_09() {
   local phase=1 total_req=0 err_req=0 c1=0 c2=0
   local event_msg="Trafico continuo activo contra Gateway :8080"
   local ring=() abort_act="" hdr="$TMP/traf_hdr.txt" code inst ts col
-  local last_poll
-  last_poll=$(date +%s)
+  local stop_trig_ms=0 start_trig_ms=0 detect_ms=-1 rejoin_ms=-1 consec_c1=0 streak_ms=0 now_m
+  : > "$TMP/s9_errs.txt"
 
   render_s9_body() {
-    [ -t 1 ] && printf '\033[9;1H'
-    local status_txt
-    case "$phase" in
-      1) status_txt="Trafico activo (ms-cuentas-1 + ms-cuentas-2)  |  [ESPACIO] Detener :8082" ;;
-      2) status_txt="ms-cuentas-2 DETENIDA · Failover en Gateway   |  [ESPACIO] Reiniciar :8082" ;;
-      3) status_txt="Recuperando instancia (~25s JVM)              |  [ESPACIO] Ver resumen" ;;
-    esac
+    [ -t 1 ] && printf '\033[%d;1H' "$((DOCK_ROW + 4))"
+    local status_txt err_codes="" tot_line
+    if [ "$INNER_W" -ge 74 ]; then
+      case "$phase" in
+        1) status_txt="Trafico activo (ms-cuentas-1 + ms-cuentas-2)  |  [ESPACIO] Detener :8082" ;;
+        2) status_txt="ms-cuentas-2 DETENIDA · Midiendo deteccion  |  [ESPACIO] Reiniciar :8082" ;;
+        3) status_txt="Recuperando instancia (~25s JVM)              |  [ESPACIO] Ver resumen" ;;
+      esac
+    else
+      case "$phase" in
+        1) status_txt="Activo (:8081 + :8082) | [ESPACIO] Detener :8082" ;;
+        2) status_txt=":8082 DETENIDA (deteccion) | [ESPACIO] Reiniciar" ;;
+        3) status_txt="Recuperando JVM (~25s) | [ESPACIO] Ver resumen" ;;
+      esac
+    fi
+    if [ "$err_req" -gt 0 ]; then
+      err_codes=" [$(sort "$TMP/s9_errs.txt" | uniq -c | awk '{printf "%s %s x%s, ", $2, $3, $1}' | sed 's/, $//')]"
+    fi
+    tot_line="$(printf 'Total: %-4d  cta-1: %-4d  cta-2: %-4d  Errores: %d%s' "$total_req" "$c1" "$c2" "$err_req" "$err_codes")"
+    [ "${#tot_line}" -gt "$INNER_W" ] && tot_line="Tot:${total_req} c1:${c1} c2:${c2} Err:${err_req}${err_codes}"
     local ccol="$C_GREEN"; [ "$err_req" -gt 0 ] && ccol="$C_RED"
     box_top "TELEMETRIA EN VIVO (VENTANA FIJA)" "$C_YELLOW"
     box_line "$status_txt" "$C_YELLOW" "$C_YELLOW"
-    box_line "$(printf 'Peticiones: %-4d  ms-cuentas-1: %-4d  ms-cuentas-2: %-4d  Errores: %d' "$total_req" "$c1" "$c2" "$err_req")" "$ccol" "$C_YELLOW"
+    box_line "$tot_line" "$ccol" "$C_YELLOW"
     box_bottom "$C_YELLOW"
 
     box_top "ULTIMAS PETICIONES" "$C_DIM"
@@ -788,30 +1203,44 @@ slide_09() {
       fi
     done
     box_bottom "$C_DIM"
-    printf '  %s%s%s\n' "$C_CYAN" "$(pad_fixed "$event_msg" 74)" "$C_RESET"
+    printf '%s  %s%s%s%s\n' "$MARGIN" "$C_CYAN" "$(pad_fixed "$event_msg" "$INNER_W")" "$C_RESET" "$CLR_EOL"
     end_frame
   }
 
   while true; do
-    local now
-    now=$(date +%s)
-    if [ $((now - last_poll)) -ge 2 ]; then
-      last_poll="$now"
-      update_dock_in_place
+    if [ "$RESIZED" -eq 1 ]; then
+      slide_chrome 9 5 "Alta Disponibilidad HTTP · Caída de ms-cuentas-2"
     fi
+    start_dock_probe_bg
 
     code="$(curl -s --max-time 3 -o /dev/null -D "$hdr" -w '%{http_code}' "$GATEWAY/api/cuentas/$ORIGEN" 2>/dev/null)" || code="000"
     [ -z "$code" ] && code="000"
     inst="$(grep -i '^X-Service-Instance:' "$hdr" 2>/dev/null | head -n 1 | cut -d':' -f2- | sed 's/^[[:space:]]*//; s/\r$//')"
     [ -z "$inst" ] && inst="sin-instancia"
+    now_m="$(now_ms)"
     ts="$(date +%T)"
     total_req=$((total_req + 1))
     if [ "$code" != "200" ]; then
       err_req=$((err_req + 1)); col="$C_RED"
+      printf 'HTTP %s\n' "$code" >> "$TMP/s9_errs.txt"
+      consec_c1=0; streak_ms=0
     elif echo "$inst" | grep -q 'ms-cuentas-2'; then
       c2=$((c2 + 1)); col="$C_CYAN"
+      consec_c1=0; streak_ms=0
+      if [ "$phase" -eq 3 ] && [ "$rejoin_ms" -lt 0 ] && [ "$start_trig_ms" -gt 0 ]; then
+        rejoin_ms=$((now_m - start_trig_ms))
+        event_msg="[EVENTO] ms-cuentas-2 reincorporada en $(fmt_ms_sec "$rejoin_ms")s!"
+      fi
     else
       c1=$((c1 + 1)); col="$C_GREEN"
+      if [ "$phase" -ge 2 ] && [ "$detect_ms" -lt 0 ] && [ "$stop_trig_ms" -gt 0 ]; then
+        [ "$consec_c1" -eq 0 ] && streak_ms="$now_m"
+        consec_c1=$((consec_c1 + 1))
+        if [ "$consec_c1" -ge 3 ]; then
+          detect_ms=$((streak_ms - stop_trig_ms))
+          event_msg="[EVENTO] Convergencia exclusiva a ms-cuentas-1 ($(fmt_ms_sec "$detect_ms")s)"
+        fi
+      fi
     fi
     ring+=("$col|[$ts]  HTTP $code  ->  $inst")
     if [ "${#ring[@]}" -gt 6 ]; then
@@ -820,20 +1249,11 @@ slide_09() {
 
     render_s9_body
 
-    # Espera breve no bloqueante con lectura de tecla
     local k=""
     if [ "${BASH_VERSINFO[0]:-3}" -ge 4 ]; then
-      if IFS= read -rsn1 -t 0.25 k; then
-        parse_key_char "$k"
-      else
-        ACT=""
-      fi
+      if IFS= read -rsn1 -t 0.25 k; then parse_key_char "$k"; else ACT=""; fi
     else
-      if IFS= read -rsn1 -t 1 k; then
-        parse_key_char "$k"
-      else
-        ACT=""
-      fi
+      if IFS= read -rsn1 -t 1 k; then parse_key_char "$k"; else ACT=""; fi
     fi
 
     if [ -n "$ACT" ]; then
@@ -843,12 +1263,14 @@ slide_09() {
         *)
           if [ "$phase" -eq 1 ]; then
             phase=2
-            event_msg="[ACCION] Deteniendo ms-cuentas-2 (docker compose stop)..."
+            stop_trig_ms="$(now_ms)"; consec_c1=0; streak_ms=0
+            event_msg="[ACCION] Deteniendo ms-cuentas-2 (docker compose stop)"
             ( docker compose stop ms-cuentas-2 >/dev/null 2>&1 ) &
             BG_DOCKER_PID=$!
           elif [ "$phase" -eq 2 ]; then
             phase=3
-            event_msg="[ACCION] Reiniciando ms-cuentas-2 (docker compose start)..."
+            start_trig_ms="$(now_ms)"
+            event_msg="[ACCION] Reiniciando ms-cuentas-2 (docker compose start)"
             ( docker compose start ms-cuentas-2 >/dev/null 2>&1 ) &
             BG_DOCKER_PID=$!
           else
@@ -865,83 +1287,133 @@ slide_09() {
   fi
   if [ -n "$abort_act" ]; then ACT="$abort_act"; return; fi
 
-  LAST_BURST_SUMMARY="Total peticiones: $total_req  |  Exitosas (200): $((total_req - err_req))  |  Errores (!=200): $err_req"
-  slide_chrome 9 5 "Alta Disponibilidad HTTP · Resumen de Contingencia"
-  printf '\n'
-  local rcol="$C_GREEN"; [ "$err_req" -gt 0 ] && rcol="$C_RED"
-  box_top "RESUMEN DE ALTA DISPONIBILIDAD" "$rcol"
-  box_line "$LAST_BURST_SUMMARY" "$rcol" "$rcol"
-  box_line "Distribucion: ms-cuentas-1=$c1  |  ms-cuentas-2=$c2" "$C_WHITE" "$rcol"
-  box_line "Eureka dio de baja la instancia y API Gateway reintento GET sin errores." "$C_CYAN" "$rcol"
+  local err_summary det_str rej_str rcol="$C_GREEN"
+  if [ "$err_req" -gt 0 ]; then
+    err_summary="$(sort "$TMP/s9_errs.txt" | uniq -c | awk '{printf "%s %s x%s, ", $2, $3, $1}' | sed 's/, $//')"
+    rcol="$C_YELLOW"
+  else
+    err_summary="ninguno (reintento GET en Gateway)"
+  fi
+  if [ "$detect_ms" -ge 0 ]; then det_str="$(fmt_ms_sec "$detect_ms")s"; else det_str="inmediata"; fi
+  if [ "$rejoin_ms" -ge 0 ]; then rej_str="$(fmt_ms_sec "$rejoin_ms")s"; else rej_str="~25s JVM"; fi
+
+  LAST_BURST_LINES=(
+    "Total: $total_req  |  Exitosas (200): $((total_req - err_req))  |  Errores: $err_req"
+    "Errores transitorios : $err_summary"
+    "Distribucion : ms-cuentas-1=$c1  |  ms-cuentas-2=$c2"
+    "Deteccion    : $det_str  |  Retorno: $rej_str"
+    "Limitacion   : Gateway reintenta GET (no POST /transferir)"
+  )
+
+  slide_chrome 9 5 "Alta Disponibilidad HTTP · Errores y Tiempos Observados"
+  ui_blank
+  box_top "RESUMEN DE FALLO Y CONVERGENCIA" "$rcol"
+  box_line "${LAST_BURST_LINES[0]}" "$rcol" "$rcol"
+  box_line "${LAST_BURST_LINES[1]}" "$( [ "$err_req" -eq 0 ] && echo "$C_GREEN" || echo "$C_RED" )" "$rcol"
+  box_line "${LAST_BURST_LINES[2]}" "$C_WHITE" "$rcol"
+  box_line "${LAST_BURST_LINES[3]}" "$C_CYAN" "$rcol"
+  box_line "${LAST_BURST_LINES[4]}" "$C_DIM" "$rcol"
   box_bottom "$rcol"
   wait_slide_footer "5b. Caída de réplica PostgreSQL"
 }
 
 slide_10() {
   slide_chrome 10 5 "Alta Disponibilidad de Datos · Caída de Réplica PG"
-  printf '\n'
+  ui_blank
   box_top "ESCENARIO: FALLO DE NODO DE LECTURA EN CALIENTE" "$C_YELLOW"
   box_line "" "$C_WHITE" "$C_YELLOW"
   box_line "  ● Se detiene replica1 mientras el servicio recibe consultas." "$C_WHITE" "$C_YELLOW"
-  box_line "  ● El enrutador @UsarNodo captura el fallo y redirige la lectura" "$C_WHITE" "$C_YELLOW"
-  box_line "    a la replica sana (X-Db-Fallback: true)." "$C_WHITE" "$C_YELLOW"
-  box_line "" "$C_WHITE" "$C_YELLOW"
-  box_line "  PRUEBA: docker compose stop replica1  +  20 lecturas consecutivas" "$C_CYAN" "$C_YELLOW"
+  if [ "$INNER_W" -ge 68 ]; then
+    box_line "  ● @UsarNodo captura la excepcion y reintenta sobre la replica" "$C_WHITE" "$C_YELLOW"
+    box_line "    sana (X-Db-Fallback: true) hasta que la sonda actua." "$C_WHITE" "$C_YELLOW"
+    box_line "" "$C_WHITE" "$C_YELLOW"
+    box_line "  PRUEBA: docker compose stop replica1  +  20 lecturas" "$C_CYAN" "$C_YELLOW"
+  else
+    box_line "  ● @UsarNodo reintenta sobre replica sana (X-Db-Fallback)" "$C_WHITE" "$C_YELLOW"
+    box_line "    hasta que la sonda cada 3s marca replica1 caida." "$C_WHITE" "$C_YELLOW"
+    box_line "" "$C_WHITE" "$C_YELLOW"
+    box_line "  PRUEBA: stop replica1 + 20 lecturas consecutivas" "$C_CYAN" "$C_YELLOW"
+  fi
   box_line "" "$C_WHITE" "$C_YELLOW"
   box_bottom "$C_YELLOW"
-  wait_slide_footer "Ejecutar caída de replica1 y lecturas"
+  wait_slide_footer "Caída replica1 + lecturas"
 }
 
 slide_11() {
-  docker compose stop replica1 >/dev/null 2>&1 || true
+  local use_cache="${1:-0}"
+  if [ "$use_cache" -eq 0 ] || [ "$CACHE_LECT11_READY" -eq 0 ]; then
+    docker compose stop replica1 >/dev/null 2>&1 || true
+    STOP_REP_MS="$(now_ms)"
+    fetch_dock_sync
+    fetch_lecturas_data "11"
+    CACHE_LECT11_READY=1
+  fi
   slide_chrome 11 5 "Failover Transparente · Lecturas sobre REPLICA_2"
-  printf '\n  %s$ docker compose stop replica1  [OK]%s\n\n' "$C_CYAN" "$C_RESET"
-  render_lecturas_box "$C_YELLOW"
-  printf '  %s[ %s/20 RESPUESTAS 200 OK · TODAS EN REPLICA_2 · FALLBACK=%s RESCATADAS ]%s\n' "$C_GREEN" "$LECT_OK" "$LECT_FB" "$C_RESET"
+  ui_blank
+  ui_line "$C_CYAN" "  \$ docker compose stop replica1  [OK]"
+  ui_blank
+  render_lecturas_from_cache "11" "$C_YELLOW"
+  local col="$C_GREEN"; [ "$LECT_ERR" -gt 0 ] && col="$C_YELLOW"
+  ui_line "$col" "  [ $LECT_OK/20 OK · ERRORES: $LECT_ERR_DETAIL · FALLBACK=$LECT_FB · TIEMPO=${LECT_SEC}s ]"
   wait_slide_footer "Estado de salud de réplicas"
 }
 
 render_db_estado_box() {
-  local title="$1" code
-  code="$(api_req GET "$GATEWAY/api/cuentas/db/estado" "" 5)"
+  local title="$1" code="$2" json_file="$3"
   box_top "$title" "$C_CYAN"
   if [ "$code" = "200" ]; then
     case "$JSON_TOOL" in
       jq)
-        local srv
-        srv="$(jq -r '.servicio // empty' "$BODY_FILE" 2>/dev/null)"
-        [ -n "$srv" ] && box_line "Consultado en instancia: $srv" "$C_DIM" "$C_CYAN"
-        jq -r '.replicas[] | "\(.nodo)|\(.available)|\(.consecutiveSuccesses)|\(.lastReplayLsn // "-")"' "$BODY_FILE" 2>/dev/null | \
+        local srv ct
+        srv="$(jq -r '.servicio // empty' "$json_file" 2>/dev/null)"
+        ct="$(jq -r 'if .consultasTotales then " · Consultas: PRI=\(.consultasTotales.PRIMARY // 0) R1=\(.consultasTotales.REPLICA_1 // 0) R2=\(.consultasTotales.REPLICA_2 // 0)" else "" end' "$json_file" 2>/dev/null)"
+        [ -n "$srv$ct" ] && box_line "Instancia: $srv$ct" "$C_DIM" "$C_CYAN"
+        jq -r '.replicas[] | "\(.nodo)|\(.available)|\(.consecutiveSuccesses)|\(.lastReplayLsn // "-")"' "$json_file" 2>/dev/null | \
           while IFS='|' read -r nodo avail succ lsn; do
             local badge col="$C_RED"
-            badge="[✗ CAIDA  · available=false]"
-            if [ "$avail" = "true" ]; then badge="[● ACTIVA · available=true ]"; col="$C_GREEN"; fi
-            box_line "$(printf '%-10s %s  exitos=%-3s LSN=%s' "$nodo" "$badge" "$succ" "$lsn")" "$col" "$C_CYAN"
+            if [ "$INNER_W" -ge 66 ]; then
+              badge="[✗ CAIDA  · available=false]"
+              [ "$avail" = "true" ] && badge="[● ACTIVA · available=true ]" && col="$C_GREEN"
+              box_line "$(printf '%-10s %s  exitos=%-3s LSN=%s' "$nodo" "$badge" "$succ" "$lsn")" "$col" "$C_CYAN"
+            else
+              badge="[✗ CAIDA ]"
+              [ "$avail" = "true" ] && badge="[● ACTIVA]" && col="$C_GREEN"
+              box_line "$(printf '%-10s %s ok=%-4s LSN=%s' "$nodo" "$badge" "$succ" "$lsn")" "$col" "$C_CYAN"
+            fi
           done
         ;;
       python3|python)
-        "$JSON_TOOL" - "$BODY_FILE" <<'PY' | tr -d '\r' | while IFS='|' read -r kind f1 f2 f3 f4; do
+        "$JSON_TOOL" - "$json_file" <<'PY' | tr -d '\r' | while IFS='|' read -r kind f1 f2 f3 f4; do
 import json, sys
 try:
     d = json.load(open(sys.argv[1], encoding="utf-8"))
-    if d.get("servicio"):
-        print(f"SRV|{d['servicio']}|||")
+    srv = d.get("servicio") or ""
+    ct = d.get("consultasTotales")
+    ct_txt = f" · Consultas: PRI={ct.get('PRIMARY',0)} R1={ct.get('REPLICA_1',0)} R2={ct.get('REPLICA_2',0)}" if ct else ""
+    if srv or ct_txt:
+        print(f"SRV|{srv}{ct_txt}|||")
     for rep in d.get("replicas", []):
         print(f"REP|{rep.get('nodo')}|{str(rep.get('available')).lower()}|{rep.get('consecutiveSuccesses')}|{rep.get('lastReplayLsn')}")
 except Exception:
     pass
 PY
           if [ "$kind" = "SRV" ]; then
-            box_line "Consultado en instancia: $f1" "$C_DIM" "$C_CYAN"
+            box_line "Instancia: $f1" "$C_DIM" "$C_CYAN"
           else
             local badge col="$C_RED"
-            badge="[✗ CAIDA  · available=false]"
-            if [ "$f2" = "true" ]; then badge="[● ACTIVA · available=true ]"; col="$C_GREEN"; fi
-            box_line "$(printf '%-10s %s  exitos=%-3s LSN=%s' "$f1" "$badge" "$f3" "$f4")" "$col" "$C_CYAN"
+            if [ "$INNER_W" -ge 66 ]; then
+              badge="[✗ CAIDA  · available=false]"
+              [ "$f2" = "true" ] && badge="[● ACTIVA · available=true ]" && col="$C_GREEN"
+              box_line "$(printf '%-10s %s  exitos=%-3s LSN=%s' "$f1" "$badge" "$f3" "$f4")" "$col" "$C_CYAN"
+            else
+              badge="[✗ CAIDA ]"
+              [ "$f2" = "true" ] && badge="[● ACTIVA]" && col="$C_GREEN"
+              box_line "$(printf '%-10s %s ok=%-4s LSN=%s' "$f1" "$badge" "$f3" "$f4")" "$col" "$C_CYAN"
+            fi
           fi
         done
         ;;
-      *) box_line "$(cat "$BODY_FILE")" "$C_WHITE" "$C_CYAN" ;;
+      *) box_line "$(cat "$json_file")" "$C_WHITE" "$C_CYAN" ;;
     esac
   else
     box_line "HTTP $code al consultar db/estado" "$C_RED" "$C_CYAN"
@@ -950,66 +1422,88 @@ PY
 }
 
 slide_12() {
+  local use_cache="${1:-0}"
   slide_chrome 12 5 "Detección Automática de Réplica Caída (Sondeo 3s)"
-  printf '\n'
-  render_db_estado_box "SALUD DE REPLICAS (/api/cuentas/db/estado)"
-  printf '\n'
-  box_top "MECANISMO DE DETECCION" "$C_DIM"
-  box_line "● ReplicaHealthTracker sondea cada 3 segundos con pg_is_in_recovery()." "$C_WHITE" "$C_DIM"
-  box_line "● REPLICA_1 queda fuera del Round-Robin sin errores para el cliente." "$C_WHITE" "$C_DIM"
+  ui_blank
+  if [ "$use_cache" -eq 0 ] || [ -z "$CACHE_EST12_CODE" ]; then
+    CACHE_EST12_CODE="$(api_req GET "$GATEWAY/api/cuentas/db/estado" "" 5)"
+    cp "$BODY_FILE" "$TMP/est12_cache.json" 2>/dev/null || true
+  fi
+  render_db_estado_box "SALUD DE REPLICAS (/api/cuentas/db/estado)" "$CACHE_EST12_CODE" "$TMP/est12_cache.json"
+  ui_blank
+  local elap="sondeo cada 3.0s"
+  [ "$STOP_REP_MS" -gt 0 ] && elap="$(fmt_ms_sec $(( $(now_ms) - STOP_REP_MS )))s tras stop"
+  box_top "DETECCION Y LIMITACIONES" "$C_DIM"
+  box_line "● Deteccion: $elap (ReplicaHealthTracker, c/3s)." "$C_WHITE" "$C_DIM"
+  box_line "● Limitacion: failover solo lectura (no promueve PRIMARY)." "$C_YELLOW" "$C_DIM"
   box_bottom "$C_DIM"
   wait_slide_footer "Reiniciar replica1 (recuperación WAL)"
 }
 
 slide_13() {
-  docker compose start replica1 >/dev/null 2>&1 || true
+  local use_cache="${1:-0}"
+  if [ "$use_cache" -eq 0 ]; then
+    docker compose start replica1 >/dev/null 2>&1 || true
+    START_REP_MS="$(now_ms)"
+    fetch_dock_sync
+  fi
   slide_chrome 13 5 "Recuperación de Réplica · Streaming WAL y Umbral 2/2"
-  printf '\n  %s$ docker compose start replica1  [OK]%s\n\n' "$C_CYAN" "$C_RESET"
+  ui_blank
+  ui_line "$C_CYAN" "  \$ docker compose start replica1  [OK]"
+  ui_blank
   box_top "SINCRONIZACION AUTOMATICA EN CURSO" "$C_GREEN"
   box_line "[✓] Contenedor replica1 reiniciado." "$C_GREEN" "$C_GREEN"
-  box_line "[~] Sincronizando registros WAL pendientes desde el nodo primario..." "$C_YELLOW" "$C_GREEN"
-  box_line "[~] Umbral de reincorporacion: 2 chequeos consecutivos sanos (2 x 3s)." "$C_CYAN" "$C_GREEN"
+  box_line "[~] Sincronizando registros WAL desde el nodo primario." "$C_YELLOW" "$C_GREEN"
+  box_line "[~] Umbral de retorno: 2 chequeos sanos seguidos (2 x 3s)." "$C_CYAN" "$C_GREEN"
   box_bottom "$C_GREEN"
-  wait_slide_footer "Verificar reincorporación al Round-Robin"
+  wait_slide_footer "Verificar retorno al Round-Robin"
 }
 
 slide_14() {
+  local use_cache="${1:-0}"
   slide_chrome 14 5 "Reincorporación Automática de replica1 al Round-Robin"
-  printf '\n'
-  render_db_estado_box "SALUD DE REPLICAS TRAS RECUPERACION (/api/cuentas/db/estado)"
-  printf '\n'
-  box_top "RETORNO AUTOMATICO" "$C_DIM"
-  box_line "● Una vez completados 2 chequeos exitosos, REPLICA_1 regresa al balanceo." "$C_WHITE" "$C_DIM"
+  ui_blank
+  if [ "$use_cache" -eq 0 ] || [ -z "$CACHE_EST14_CODE" ]; then
+    CACHE_EST14_CODE="$(api_req GET "$GATEWAY/api/cuentas/db/estado" "" 5)"
+    cp "$BODY_FILE" "$TMP/est14_cache.json" 2>/dev/null || true
+  fi
+  render_db_estado_box "SALUD DE REPLICAS TRAS RECUPERACION (/api/cuentas/db/estado)" "$CACHE_EST14_CODE" "$TMP/est14_cache.json"
+  ui_blank
+  local elap="~6-8s habituales"
+  [ "$START_REP_MS" -gt 0 ] && elap="$(fmt_ms_sec $(( $(now_ms) - START_REP_MS )))s tras start"
+  box_top "RETORNO AUTOMATICO Y LIMITACION" "$C_DIM"
+  box_line "● Retorno: $elap (2x pg_is_in_recovery=true)." "$C_WHITE" "$C_DIM"
+  box_line "● Limitacion: depende de wal_keep_size (usar slots en prod)." "$C_YELLOW" "$C_DIM"
   box_bottom "$C_DIM"
   wait_slide_footer "6. Conclusiones técnicas"
 }
 
 slide_15() {
   slide_chrome 15 6 "Conclusiones Técnicas · Decisiones, Limitaciones y Mejoras"
-  printf '\n'
-  printf ' %s┌─ DECISIONES ──────────┐ ┌─ LIMITACIONES ────────┐ ┌─ MEJORAS FUTURAS ─────┐%s\n' "$C_CYAN" "$C_RESET"
-  local rows=(
-    "· BD por @UsarNodo|· Sin failover primario|· Failover (Patroni)"
-    "  write->PRI / read->REP|· Eureka unico (SPOF)|· Claves idempotencia"
-    "· Round Robin + salud|· /movimiento-interno|· Retry conexion en"
-    "  chequeo 2 de 2|  expuesto en Gateway|  ms-transacciones"
-    "· Eureka sin cache +|· Limite diario no se|· Health Eureka real"
-    "  retry GET (0 err P03)|  reinicia solo|· Bloquear ruta interna"
-    "· Flyway advisory lock|· Sin idempotencia P2P|  y Sagas / Outbox"
-  )
-  local r c1 c2 c3
-  for r in "${rows[@]}"; do
-    c1="$(echo "$r" | cut -d'|' -f1)"
-    c2="$(echo "$r" | cut -d'|' -f2)"
-    c3="$(echo "$r" | cut -d'|' -f3)"
-    printf ' %s│%s%s%s│ │%s%s%s│ │%s%s%s│%s\n' \
-      "$C_GREEN" "$C_WHITE" "$(pad_fixed "$c1" 23)" "$C_YELLOW" \
-      "$C_WHITE" "$(pad_fixed "$c2" 23)" "$C_CYAN" \
-      "$C_WHITE" "$(pad_fixed "$c3" 23)" "$C_CYAN" "$C_RESET"
-  done
-  printf ' %s└───────────────────────┘ └───────────────────────┘ └───────────────────────┘%s\n' "$C_DIM" "$C_RESET"
+  ui_blank
+  if [ "$INNER_W" -ge 72 ]; then
+    write_three_col_cards "DECISIONES" "LIMITACIONES" "MEJORAS FUTURAS" "$C_GREEN" "$C_YELLOW" "$C_CYAN" \
+      "· BD por @UsarNodo|· Sin failover primario|· Failover (Patroni)" \
+      "  write->PRI  read->REP|· Eureka unico (SPOF)|· Claves idempotencia" \
+      "· Round Robin + salud|· /movimiento-interno|· Retry conexion en" \
+      "  chequeo 2 de 2|  expuesto en Gateway|  ms-transacciones" \
+      "· Eureka sin cache +|· Limite diario no se|· Health Eureka real" \
+      "  retry GET (0 err P03)|  reinicia solo|· Bloquear ruta interna" \
+      "· Flyway advisory lock|· Sin idempotencia P2P|  y Sagas / Outbox"
+  else
+    write_three_col_cards "DECISIONES" "LIMITACIONES" "MEJORAS" "$C_GREEN" "$C_YELLOW" "$C_CYAN" \
+      "· @UsarNodo JDBC|· Sin failover PRI|· Failover Patroni" \
+      "  W:PRI R:REPLICA|· Eureka unico|· Idempotencia P2P" \
+      "· Round-Robin 2/2|· /mov-interno en|· Retry conexion" \
+      "  salud verificada|  ruta del Gateway|  ms-transacciones" \
+      "· Eureka sin cache|· Limite diario|· Health Eureka" \
+      "  + retry GET GW|  sin auto-reset|· Cerrar /mov-int" \
+      "· Flyway adv. lock|· Sin idempotencia|  + Sagas / Outbox"
+  fi
+  local quote='"Mas de uno de todo, y saber esquivar al que falla. Sistema distribuido."'
+  [ "$INNER_W" -lt 74 ] && quote='"Replicar cada capa y esquivar al nodo que falla."'
   box_top "SINTESIS FINAL" "$C_CYAN"
-  box_line '  "Mas de uno de todo, y saber esquivar al que falla. Sistema distribuido."' "$C_CYAN" "$C_CYAN"
+  box_line "$(pad_center "$quote" "$INNER_W")" "$C_CYAN" "$C_CYAN"
   box_bottom "$C_CYAN"
   wait_slide_footer "Volver a Portada"
 }
@@ -1036,6 +1530,7 @@ run_deck() {
     "${SLIDES[$idx]}" "$use_cache"
     use_cache=0
     case "$ACT" in
+      RESIZE) use_cache=1; continue ;;
       PREV)
         [ "$idx" -eq 0 ] && { ACT="PORTADA"; return; }
         idx=$((idx - 1))
@@ -1046,6 +1541,7 @@ run_deck() {
       QUIT)   ACT="QUIT"; return ;;
       UTILS)
         show_utils_panel
+        FIRST_FRAME=1
         [ "$ACT" = "QUIT" ] && return
         if [[ "$ACT" =~ ^B[1-6]$ ]]; then idx="$(block_to_idx "$ACT")"; fi
         ;;
@@ -1057,55 +1553,107 @@ run_deck() {
 }
 
 show_portada() {
+  local last_sal_poll=0 sinfo=""
   while true; do
-    DOCK_ROW=5
     begin_frame
-    printf '%s╔%s╗%s\n' "$C_CYAN" "$(repeat_char '═' 76)" "$C_RESET"
-    printf '%s║ %s%s%s ║%s\n' "$C_CYAN" "${C_BOLD}${C_CYAN}" "$(pad_fixed "BILLETERA DIGITAL DISTRIBUIDA  ·  ARQUITECTURA DE MICROSERVICIOS" 74)" "$C_CYAN" "$C_RESET"
-    printf '%s║ %s%s%s ║%s\n' "$C_CYAN" "$C_DIM" "$(pad_fixed "Spring Boot 3.4 · Netflix Eureka · API Gateway · PostgreSQL 17 (WAL)" 74)" "$C_CYAN" "$C_RESET"
-    printf '%s╚%s╝%s\n' "$C_CYAN" "$(repeat_char '═' 76)" "$C_RESET"
+    DOCK_ROW=$((PAD_T + 5))
+    local ptitle="BILLETERA DIGITAL DISTRIBUIDA · DEMO EN VIVO"
+    local psub="Replicacion PostgreSQL WAL, descubrimiento Eureka y failover"
+    [ "$INNER_W" -lt 66 ] && ptitle="BILLETERA DIGITAL · DEMO EN VIVO"
+    [ "$INNER_W" -lt 70 ] && psub="Replicacion Postgres WAL, Eureka y tolerancia a fallos"
+
+    printf '%s%s╔%s╗%s%s\n' "$MARGIN" "$C_CYAN" "$(repeat_char '═' "$((UI_W - 2))")" "$C_RESET" "$CLR_EOL"
+    printf '%s%s║ %s%s%s ║%s%s\n' "$MARGIN" "$C_CYAN" "${C_BOLD}${C_CYAN}" "$(pad_center "$ptitle" "$INNER_W")" "$C_CYAN" "$C_RESET" "$CLR_EOL"
+    printf '%s%s║ %s%s%s ║%s%s\n' "$MARGIN" "$C_CYAN" "$C_DIM" "$(pad_center "$psub" "$INNER_W")" "$C_CYAN" "$C_RESET" "$CLR_EOL"
+    printf '%s%s╚%s╝%s%s\n' "$MARGIN" "$C_CYAN" "$(repeat_char '═' "$((UI_W - 2))")" "$C_RESET" "$CLR_EOL"
 
     render_cluster_dock
+    if [ -t 1 ] && [ "$LAST_SCREEN_ID" != "PORTADA" ]; then
+      printf '\033[J'
+    fi
+    LAST_SCREEN_ID="PORTADA"
 
-    printf '\n'
-    printf '  %s┌─ INFRAESTRUCTURA ────┐ ┌─ OPERACION & DATOS ──┐ ┌─ ALTA DISPONIBILIDAD ┐%s\n' "$C_WHITE" "$C_RESET"
-    printf '  %s│ 1. Arquitectura      │ │ 4. Balanceo HTTP     │ │ 7. Tolerancia HTTP   │%s\n' "$C_GREEN" "$C_RESET"
-    printf '  %s│ 2. Eureka & Gateway  │ │ 5. Transferencias    │ │ 8. Failover Replica  │%s\n' "$C_CYAN" "$C_RESET"
-    printf '  %s│ 3. Cluster PG17 WAL  │ │ 6. CQRS-lite & RYOW  │ │ 9. Retorno Automatico│%s\n' "$C_YELLOW" "$C_RESET"
-    printf '  %s└──────────────────────┘ └──────────────────────┘ └──────────────────────┘%s\n\n' "$C_WHITE" "$C_RESET"
+    local leg="  ● En linea   ~ Iniciando   ✗ Caido     (actualizado en segundo plano)"
+    [ "$INNER_W" -lt 72 ] && leg="  ● En linea   ~ Iniciando   ✗ Caido"
+    ui_line "$C_DIM" "$leg"
+    ui_blank
 
-    local sinfo
-    if [ ! -f "$REPO_DIR/.env" ]; then
-      printf '  %s[AVISO] Falta .env -> [U] -> [P] Reinicio limpio%s\n' "$C_YELLOW" "$C_RESET"
-    elif sinfo="$(get_saldo_line | tr -d '\r')"; then
+    local ag_title="RECORRIDO (15 DIAPOSITIVAS) · ELIGE SECCION [1-6]"
+    [ "$INNER_W" -lt 70 ] && ag_title="RECORRIDO (15 SLIDES) · PULSA [1-6]"
+    box_top "$ag_title" "$C_CYAN"
+    local col_l=$(( (INNER_W - 3) / 2 ))
+    local col_r=$(( INNER_W - 3 - col_l ))
+    local ag_rows
+    if [ "$INNER_W" -ge 74 ]; then
+      ag_rows=(
+        "[1] Arquitectura y Docker  (01-02)|[4] Lecturas Replica y RYOW (07-08)"
+        "[2] Eureka y Balanceo HTTP (03-04)|[5] Caidas: App y Postgres  (09-14)"
+        "[3] Transferencia P2P ACID (05-06)|[6] Conclusiones Tecnicas      (15)"
+      )
+    else
+      ag_rows=(
+        "[1] Arquitectura    (01-02)|[4] Lecturas y RYOW (07-08)"
+        "[2] Eureka/Balanceo (03-04)|[5] Fallos App/BD   (09-14)"
+        "[3] P2P Transf ACID (05-06)|[6] Conclusiones       (15)"
+      )
+    fi
+    local ar lhs rhs
+    for ar in "${ag_rows[@]}"; do
+      lhs="${ar%%|*}"
+      rhs="${ar#*|}"
+      printf '%s%s│ %s%s %s│ %s%s%s │%s%s\n' \
+        "$MARGIN" "$C_CYAN" \
+        "$C_WHITE" "$(pad_fixed "$lhs" "$col_l")" \
+        "$C_DIM" \
+        "$C_WHITE" "$(pad_fixed "$rhs" "$col_r")" \
+        "$C_CYAN" "$C_RESET" "$CLR_EOL"
+    done
+    box_bottom "$C_CYAN"
+
+    local now
+    now=$(date +%s)
+    if [ $((now - last_sal_poll)) -ge 4 ]; then
+      sinfo="$(get_saldo_line | tr -d '\r' || true)"
+      last_sal_poll="$now"
+    fi
+
+    ui_blank
+    if [ -n "$sinfo" ]; then
       local s c l col="$C_GREEN" badge=" [LISTO]"
       s="$(echo "$sinfo" | cut -d'|' -f1)"; c="$(echo "$sinfo" | cut -d'|' -f2)"; l="$(echo "$sinfo" | cut -d'|' -f3)"
       if awk -v v="${c:-0}" 'BEGIN{exit !(v+0 > 0)}'; then
         col="$C_YELLOW"; badge=" [REINICIAR CON U->P]"
       fi
-      printf '  %sCuenta %s : saldo=$%s | usado=$%s/$%s%s%s\n' "$col" "$ORIGEN" "$s" "$c" "$l" "$badge" "$C_RESET"
+      ui_line "$col" "  Cuenta demo $ORIGEN : saldo=\$$s | hoy=\$$c/\$$l$badge"
+    elif [ ! -f "$REPO_DIR/.env" ]; then
+      ui_line "$C_YELLOW" "  [AVISO] Gateway sin respuesta y falta .env -> [U] -> [C] / [P]"
     else
-      printf '  %sGateway :8080 : Esperando conexion...%s\n' "$C_DIM" "$C_RESET"
+      ui_line "$C_DIM" "  Gateway :8080 sin conexion -> Pulsa [U] para iniciar servicios"
     fi
 
-    printf '%s%s%s\n' "$C_DIM" "$(repeat_char '─' 78)" "$C_RESET"
-    printf '  %s► [ESPACIO / ENTER / →] Iniciar Presentacion (Diapositiva 1/15)%s\n' "${C_BOLD}${C_GREEN}" "$C_RESET"
-    printf '    %s[1-6] Ir a Seccion   [B] Eureka   [U] Utilidades   [Q] Salir%s\n' "$C_DIM" "$C_RESET"
+    write_divider
+    local sp="  ► [ESPACIO / ENTER] Iniciar Presentacion (Diapositiva 1/15)"
+    local np="    Atajos: [1-6] Ir a seccion   [B] Eureka   [U] Utilidades   [Q] Salir"
+    [ "$UI_W" -lt 68 ] && sp="  ► [ESPACIO/→] Iniciar Presentacion (1/15)"
+    [ "$UI_W" -lt 74 ] && np="    [1-6] Seccion  [B] Eureka  [U] Utils  [Q] Salir"
+    ui_line "${C_BOLD}${C_GREEN}" "$sp"
+    ui_line "$C_DIM" "$np"
     end_frame
 
     read_slide_key_live 1
     case "$ACT" in
+      RESIZE)       continue ;;
       QUIT)         return ;;
       EUREKA)       open_eureka ;;
-      DOCK_REFRESH) update_dock_in_place ;;
-      PREP)         show_clean_prep ;;
+      DOCK_REFRESH) fetch_dock_sync; update_dock_in_place ;;
+      PREP)         show_clean_prep; last_sal_poll=0 ;;
       UTILS)
-        show_utils_panel
+        show_utils_panel; FIRST_FRAME=1; last_sal_poll=0
         [ "$ACT" = "QUIT" ] && return
         if [[ "$ACT" =~ ^B[1-6]$ ]]; then run_deck "$(block_to_idx "$ACT")"; fi
         ;;
-      B[1-6]) run_deck "$(block_to_idx "$ACT")" ;;
-      NEXT|REPEAT) run_deck 0 ;;
+      B[1-6]) run_deck "$(block_to_idx "$ACT")"; last_sal_poll=0 ;;
+      NEXT|REPEAT) run_deck 0; last_sal_poll=0 ;;
       *) ;;
     esac
     [ "$ACT" = "QUIT" ] && return

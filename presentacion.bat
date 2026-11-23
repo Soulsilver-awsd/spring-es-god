@@ -19,6 +19,7 @@ $ErrorActionPreference = "Continue"
 [Console]::InputEncoding = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
+[System.Net.ServicePointManager]::DefaultConnectionLimit = 32
 try { $Host.UI.RawUI.WindowTitle = "Billetera Digital Distribuida · Presentacion" } catch { }
 
 $RepoDir = $env:PRESENTACION_DIR.TrimEnd('\', '/')
@@ -31,41 +32,135 @@ $Destino = "0984445566"
 
 $script:Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $script:FirstFrame = $true
+$script:ForceClear = $false
+$script:FrameTop = 0
+$script:LastScreenId = ""
 $script:MaxDrawnRow = 0
 $script:DockRow = 4
+$script:WinW = 80
+$script:WinH = 25
+$script:UiW = 78
+$script:InnerW = 74
+$script:PadL = 1
+$script:PadT = 0
+$script:Margin = " "
+
+$script:LastSnap = $null
+$script:LastDockSig = ""
+$script:DockProc = $null
+$script:LastDockPoll = [DateTime]::MinValue
+
+$script:CachePsLines = $null
+$script:CacheEureka = $null
+$script:CacheBalanceo = $null
 $script:CacheTxOk = $null
 $script:CacheTxErr = $null
+$script:CacheLecturas07 = $null
+$script:CacheCritico = $null
+$script:CacheLecturas11 = $null
+$script:CacheEstado12 = $null
+$script:CacheEstado14 = $null
 $script:LastTxNodo = "PRIMARY (recovery=false)"
 $script:LastTxCodigo = "TX-2026-0001"
-$script:LastBurstSummary = $null
-
-$script:TmpDir = Join-Path ([IO.Path]::GetTempPath()) ("billetera-ppt-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
-New-Item -ItemType Directory -Path $script:TmpDir -Force | Out-Null
-$script:HeadersFile = Join-Path $script:TmpDir "headers.txt"
-$script:BodyFile    = Join-Path $script:TmpDir "body.json"
-$script:JsonFile    = Join-Path $script:TmpDir "req.json"
-$script:Utf8NoBom   = New-Object System.Text.UTF8Encoding($false)
+$script:LastBurstLines = @()
+$script:StopRepAt = $null
+$script:StartRepAt = $null
 
 function Invoke-Cleanup {
+    if ($script:DockProc) {
+        try { if (-not $script:DockProc.HasExited) { $script:DockProc.Kill() }; $script:DockProc.Dispose() } catch { }
+        $script:DockProc = $null
+    }
     if (-not [Console]::IsOutputRedirected) {
         try { [Console]::CursorVisible = $true } catch { }
     }
-    if (Test-Path $script:TmpDir) {
-        Remove-Item -Recurse -Force $script:TmpDir -ErrorAction SilentlyContinue
+}
+
+function Update-UiMetrics {
+    $w = if ($env:DEMO_COLS -match '^\d+$') { [int]$env:DEMO_COLS } else { 80 }
+    $h = if ($env:DEMO_LINES -match '^\d+$') { [int]$env:DEMO_LINES } else { 25 }
+    if (-not [Console]::IsOutputRedirected) {
+        try {
+            $w = [Console]::WindowWidth
+            $h = [Console]::WindowHeight
+        } catch { }
     }
+    $newUiW = [Math]::Min(100, [Math]::Max(64, $w - 2))
+    $newPadL = [Math]::Max(0, [int][Math]::Floor(($w - $newUiW) / 2))
+    $newPadT = if (-not [Console]::IsOutputRedirected -and $h -ge 28) {
+        [Math]::Min(3, [int][Math]::Floor(($h - 24) / 3))
+    } else { 0 }
+
+    if ($newUiW -ne $script:UiW -or $newPadL -ne $script:PadL -or $newPadT -ne $script:PadT) {
+        $script:ForceClear = $true
+    }
+    $script:WinW   = $w
+    $script:WinH   = $h
+    $script:UiW    = $newUiW
+    $script:InnerW = $newUiW - 4
+    $script:PadL   = $newPadL
+    $script:PadT   = $newPadT
+    $script:Margin = " " * $newPadL
+}
+
+function Write-BlankLine {
+    if ([Console]::IsOutputRedirected) { Write-Host ""; return }
+    Write-Host (" " * [Math]::Max(1, $script:WinW - 1))
+}
+
+function Write-CleanLine([string]$Text = "", [string]$Color = "White") {
+    $line = $script:Margin + $Text
+    if ([Console]::IsOutputRedirected) { Write-Host $line -ForegroundColor $Color; return }
+    $pad = [Math]::Max(0, ($script:WinW - 1) - $line.Length)
+    Write-Host ($line + (" " * $pad)) -ForegroundColor $Color
+}
+
+function Complete-Row {
+    if (-not [Console]::IsOutputRedirected) {
+        try {
+            $rem = ($script:WinW - 1) - [Console]::CursorLeft
+            if ($rem -gt 0) { Write-Host (" " * $rem) -NoNewline }
+        } catch { }
+    }
+    Write-Host ""
+}
+
+function Clear-TailFrom([int]$FromRow) {
+    if ([Console]::IsOutputRedirected) { return }
+    try {
+        $bufH = [Console]::BufferHeight
+        $limit = [Math]::Min($script:MaxDrawnRow, $bufH - 1)
+        if ($FromRow -le $limit) {
+            $blank = " " * [Math]::Max(1, $script:WinW - 1)
+            for ($row = $FromRow; $row -le $limit; $row++) {
+                [Console]::SetCursorPosition(0, $row)
+                [Console]::Write($blank)
+            }
+            [Console]::SetCursorPosition(0, $FromRow)
+        }
+    } catch { }
 }
 
 function Begin-Frame([bool]$HardClear = $false) {
+    Update-UiMetrics
     if ([Console]::IsOutputRedirected) { return }
-    try { [Console]::CursorVisible = $false } catch { }
-    if ($script:FirstFrame -or $HardClear) {
+    try {
+        [Console]::CursorVisible = $false
+        if ([Console]::WindowTop -ne $script:FrameTop) { $script:ForceClear = $true }
+    } catch { }
+    if ($script:FirstFrame -or $HardClear -or $script:ForceClear) {
         try {
             [Console]::Clear()
             $script:MaxDrawnRow = 0
             $script:FirstFrame = $false
+            $script:ForceClear = $false
+            $script:FrameTop = [Console]::WindowTop
         } catch { }
     } else {
-        try { [Console]::SetCursorPosition(0, 0) } catch { }
+        try { [Console]::SetCursorPosition(0, $script:FrameTop) } catch { }
+    }
+    for ($i = 0; $i -lt $script:PadT; $i++) {
+        Write-BlankLine
     }
 }
 
@@ -73,24 +168,26 @@ function End-Frame {
     if ([Console]::IsOutputRedirected) { return }
     try {
         $cur = [Console]::CursorTop
-        $bufH = [Console]::BufferHeight
-        $limit = [Math]::Min($script:MaxDrawnRow, $bufH - 1)
-        if ($cur -le $limit) {
-            $blank = " " * 78
-            for ($row = $cur; $row -le $limit; $row++) {
-                [Console]::SetCursorPosition(0, $row)
-                [Console]::Write($blank)
-            }
-            [Console]::SetCursorPosition(0, $cur)
-        }
-        if ($cur -gt $script:MaxDrawnRow) { $script:MaxDrawnRow = $cur }
+        Clear-TailFrom $cur
+        $script:MaxDrawnRow = $cur
     } catch { }
 }
 
 function Format-Fixed([string]$Text, [int]$Width) {
     if ($null -eq $Text) { $Text = "" }
-    if ($Text.Length -gt $Width) { return $Text.Substring(0, [Math]::Max(0, $Width - 3)) + "..." }
+    if ($Width -le 0) { return "" }
+    if ($Text.Length -gt $Width) {
+        if ($Width -le 3) { return $Text.Substring(0, $Width) }
+        return $Text.Substring(0, $Width - 3) + "..."
+    }
     return $Text.PadRight($Width)
+}
+
+function Format-Center([string]$Text, [int]$Width) {
+    if ($null -eq $Text) { $Text = "" }
+    if ($Text.Length -ge $Width) { return (Format-Fixed $Text $Width) }
+    $left = [int][Math]::Floor(($Width - $Text.Length) / 2)
+    return ((" " * $left) + $Text).PadRight($Width)
 }
 
 function Format-Money($Val) {
@@ -98,63 +195,121 @@ function Format-Money($Val) {
     try { return [string]::Format($script:Inv, "{0:F2}", [decimal]$Val) } catch { return "$Val" }
 }
 
-function Get-ProgressBar([int]$SlideNum, [int]$TotalSlides = 15) {
-    $filled = [int][Math]::Round(($SlideNum / $TotalSlides) * 10)
-    $empty = 10 - $filled
-    return ("[" + ("█" * $filled) + ("░" * $empty) + "]")
+function Get-ProgressBar([int]$SlideNum, [int]$TotalSlides = 15, [int]$Width = 10) {
+    $filled = [int][Math]::Round(($SlideNum / $TotalSlides) * $Width)
+    $filled = [Math]::Max(0, [Math]::Min($Width, $filled))
+    return ("[" + ("█" * $filled) + ("░" * ($Width - $filled)) + "]")
 }
 
 function Write-BoxTop([string]$Title, [string]$Color = "DarkGray") {
     $t = " " + $Title + " "
-    $fill = [Math]::Max(2, 75 - $t.Length)
-    Write-Host ("┌─" + $t + ("─" * $fill) + "┐") -ForegroundColor $Color
+    $maxT = [Math]::Max(4, $script:UiW - 6)
+    if ($t.Length -gt $maxT) { $t = $t.Substring(0, $maxT) }
+    $fill = [Math]::Max(2, ($script:UiW - 3) - $t.Length)
+    Write-CleanLine ("┌─" + $t + ("─" * $fill) + "┐") $Color
 }
 
 function Write-BoxLine([string]$Text, [string]$TextColor = "White", [string]$BorderColor = "DarkGray") {
-    Write-Host "│ " -ForegroundColor $BorderColor -NoNewline
-    Write-Host (Format-Fixed $Text 74) -ForegroundColor $TextColor -NoNewline
-    Write-Host " │" -ForegroundColor $BorderColor
+    Write-Host ($script:Margin + "│ ") -ForegroundColor $BorderColor -NoNewline
+    Write-Host (Format-Fixed $Text $script:InnerW) -ForegroundColor $TextColor -NoNewline
+    Write-Host " │" -ForegroundColor $BorderColor -NoNewline
+    Complete-Row
 }
 
 function Write-BoxBottom([string]$Color = "DarkGray") {
-    Write-Host ("└" + ("─" * 76) + "┘") -ForegroundColor $Color
+    Write-CleanLine ("└" + ("─" * ($script:UiW - 2)) + "┘") $Color
 }
 
-function Get-ContainerMap {
+function Write-Divider {
+    Write-CleanLine ("─" * $script:UiW) "DarkGray"
+}
+
+function Parse-DockerPsLines([string[]]$Lines) {
     $map = @{}
     $names = @("api-gateway", "eureka-server", "ms-cuentas-1", "ms-cuentas-2", "ms-transacciones", "primary", "replica1", "replica2")
     foreach ($n in $names) {
-        $map[$n] = @{ Sym = "?"; Color = "DarkGray"; State = "desconocido"; Raw = "" }
+        $map[$n] = @{ Sym = "?"; Color = "DarkGray"; State = "desconocido" }
     }
-    $dockerOk = $false
-    $healthy = 0; $running = 0; $stopped = @()
+    $dockerOk = $false; $healthy = 0; $running = 0
+    $sigParts = New-Object System.Collections.Generic.List[string]
+    if ($Lines) {
+        $dockerOk = $true
+        foreach ($line in $Lines) {
+            if (-not $line -or ($line -notmatch '\|')) { continue }
+            $p = $line -split '\|', 3
+            $svc = $p[0].Trim(); $st = $p[1].Trim(); $status = $p[2].Trim()
+            if (-not $map.ContainsKey($svc)) { continue }
+            $sigParts.Add("$svc=$st=$status")
+            if ($st -eq "running") {
+                $running++
+                if ($status -match 'unhealthy') {
+                    $map[$svc] = @{ Sym = "!"; Color = "Red"; State = "unhealthy" }
+                } elseif ($status -match 'starting') {
+                    $map[$svc] = @{ Sym = "~"; Color = "Yellow"; State = "starting" }
+                } else {
+                    $healthy++
+                    $map[$svc] = @{ Sym = "●"; Color = "Green"; State = "healthy" }
+                }
+            } else {
+                $map[$svc] = @{ Sym = "✗"; Color = "Red"; State = "detenido" }
+            }
+        }
+    }
+    $sig = "$dockerOk|$healthy|$running|" + (($sigParts | Sort-Object) -join ";")
+    return @{ Map = $map; DockerOk = $dockerOk; Healthy = $healthy; Running = $running; Sig = $sig }
+}
+
+function Get-ContainerMapSync {
     try {
         $out = & docker compose ps -a --format "{{.Service}}|{{.State}}|{{.Status}}" 2>$null
         if ($LASTEXITCODE -eq 0) {
-            $dockerOk = $true
-            foreach ($line in $out) {
-                if (-not $line -or ($line -notmatch '\|')) { continue }
-                $p = $line -split '\|', 3
-                $svc = $p[0].Trim(); $st = $p[1].Trim(); $status = $p[2].Trim()
-                if (-not $map.ContainsKey($svc)) { continue }
-                if ($st -eq "running") {
-                    $running++
-                    if ($status -match 'unhealthy') {
-                        $map[$svc] = @{ Sym = "!"; Color = "Red"; State = "unhealthy"; Raw = $status }
-                    } elseif ($status -match 'starting') {
-                        $map[$svc] = @{ Sym = "~"; Color = "Yellow"; State = "starting"; Raw = $status }
-                    } else {
-                        $healthy++
-                        $map[$svc] = @{ Sym = "●"; Color = "Green"; State = "healthy"; Raw = $status }
-                    }
-                } else {
-                    $stopped += $svc
-                    $map[$svc] = @{ Sym = "✗"; Color = "Red"; State = "detenido"; Raw = $status }
-                }
-            }
+            $snap = Parse-DockerPsLines @($out)
+            $script:LastSnap = $snap
+            $script:LastDockPoll = [DateTime]::UtcNow
+            return $snap
         }
     } catch { }
-    return @{ Map = $map; DockerOk = $dockerOk; Healthy = $healthy; Running = $running; Stopped = $stopped }
+    $snap = Parse-DockerPsLines $null
+    $script:LastSnap = $snap
+    $script:LastDockPoll = [DateTime]::UtcNow
+    return $snap
+}
+
+function Start-BackgroundDocker([string]$SubArgs) {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "docker"
+    $psi.Arguments = "compose $SubArgs"
+    $psi.WorkingDirectory = $RepoDir
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    [void]$proc.Start()
+    return $proc
+}
+
+function Poll-AsyncDock {
+    if ($script:DockProc) {
+        if ($script:DockProc.HasExited) {
+            $stdout = ""
+            try { $stdout = $script:DockProc.StandardOutput.ReadToEnd() } catch { }
+            $rc = $script:DockProc.ExitCode
+            try { $script:DockProc.Dispose() } catch { }
+            $script:DockProc = $null
+            $script:LastDockPoll = [DateTime]::UtcNow
+            $snap = if ($rc -eq 0) { Parse-DockerPsLines ($stdout -split "`r?`n") } else { Parse-DockerPsLines $null }
+            $changed = ($snap.Sig -ne $script:LastDockSig)
+            $script:LastSnap = $snap
+            if ($changed) { Update-DockInPlace $snap }
+        }
+        return
+    }
+    if (([DateTime]::UtcNow - $script:LastDockPoll).TotalMilliseconds -ge 2200) {
+        $script:LastDockPoll = [DateTime]::UtcNow
+        try { $script:DockProc = Start-BackgroundDocker 'ps -a --format "{{.Service}}|{{.State}}|{{.Status}}"' } catch { }
+    }
 }
 
 function Write-Badge([string]$Label, $Info) {
@@ -165,51 +320,87 @@ function Render-ClusterDock([bool]$SaveRow = $true, $Snap = $null) {
     if ($SaveRow -and -not [Console]::IsOutputRedirected) {
         try { $script:DockRow = [Console]::CursorTop } catch { }
     }
-    if (-not $Snap) { $Snap = Get-ContainerMap }
+    if (-not $Snap) {
+        if ($script:LastSnap) { $Snap = $script:LastSnap }
+        else { $Snap = Get-ContainerMapSync }
+    }
+    $script:LastDockSig = $Snap.Sig
     $m = $Snap.Map
     $bCol = "DarkCyan"
     if (-not $Snap.DockerOk) {
-        $title = "CLUSTER INMERSO · DOCKER DESCONECTADO"
-        $tCol = "Red"
+        $title = "MONITOR EN VIVO · DOCKER DESCONECTADO"; $tCol = "Red"
     } elseif ($Snap.Healthy -eq 8) {
-        $title = "CLUSTER INMERSO · 8/8 HEALTHY"
-        $tCol = "Green"
+        $title = "MONITOR EN VIVO · 8/8 EN LINEA"; $tCol = "Green"
     } else {
-        $title = ("CLUSTER INMERSO · {0}/8 HEALTHY · {1}/8 ACTIVOS" -f $Snap.Healthy, $Snap.Running)
-        $tCol = "Yellow"
+        $title = ("MONITOR EN VIVO · {0}/8 HEALTHY · {1}/8 ACTIVOS" -f $Snap.Healthy, $Snap.Running); $tCol = "Yellow"
     }
     $t = " " + $title + " "
-    $fill = [Math]::Max(2, 75 - $t.Length)
-    Write-Host "┌─" -ForegroundColor $bCol -NoNewline
+    $fill = [Math]::Max(2, ($script:UiW - 3) - $t.Length)
+    Write-Host ($script:Margin + "┌─") -ForegroundColor $bCol -NoNewline
     Write-Host $t -ForegroundColor $tCol -NoNewline
-    Write-Host (("─" * $fill) + "┐") -ForegroundColor $bCol
+    Write-Host (("─" * $fill) + "┐") -ForegroundColor $bCol -NoNewline
+    Complete-Row
 
-    # Fila 1 (74 inner chars): EDGE [● gateway :8080] [● eureka :8761]  BD [● primary] [● rep1] [● rep2]
-    Write-Host "│ " -ForegroundColor $bCol -NoNewline
-    Write-Host "EDGE " -ForegroundColor DarkGray -NoNewline
-    Write-Badge "gateway :8080" $m["api-gateway"]
-    Write-Host " " -NoNewline
-    Write-Badge "eureka :8761" $m["eureka-server"]
-    Write-Host "  BD " -ForegroundColor DarkGray -NoNewline
-    Write-Badge "primary" $m["primary"]
-    Write-Host " " -NoNewline
-    Write-Badge "rep1" $m["replica1"]
-    Write-Host " " -NoNewline
-    Write-Badge "rep2" $m["replica2"]
-    Write-Host "  │" -ForegroundColor $bCol
+    if ($script:InnerW -ge 74) {
+        # Fila 1: 71 chars fijos + gap central + relleno = InnerW exacto
+        $mid = [Math]::Max(2, [int][Math]::Floor(($script:InnerW - 71) / 2))
+        $rem1 = [Math]::Max(0, $script:InnerW - (71 + $mid))
+        Write-Host ($script:Margin + "│ ") -ForegroundColor $bCol -NoNewline
+        Write-Host "RED  " -ForegroundColor DarkGray -NoNewline
+        Write-Badge "gateway :8080" $m["api-gateway"]
+        Write-Host " " -NoNewline
+        Write-Badge "eureka :8761" $m["eureka-server"]
+        Write-Host (" " * $mid) -NoNewline
+        Write-Host "BD " -ForegroundColor DarkGray -NoNewline
+        Write-Badge "primary" $m["primary"]
+        Write-Host " " -NoNewline
+        Write-Badge "rep1" $m["replica1"]
+        Write-Host " " -NoNewline
+        Write-Badge "rep2" $m["replica2"]
+        Write-Host ((" " * $rem1) + " │") -ForegroundColor $bCol -NoNewline
+        Complete-Row
 
-    # Fila 2 (74 inner chars): APPS [● cuentas-1 :8081] [● cuentas-2 :8082] [● transacciones :8083]
-    Write-Host "│ " -ForegroundColor $bCol -NoNewline
-    Write-Host "APPS " -ForegroundColor DarkGray -NoNewline
-    Write-Badge "cuentas-1 :8081" $m["ms-cuentas-1"]
-    Write-Host " " -NoNewline
-    Write-Badge "cuentas-2 :8082" $m["ms-cuentas-2"]
-    Write-Host " " -NoNewline
-    Write-Badge "transacciones :8083" $m["ms-transacciones"]
-    Write-Host (" " * 7) -NoNewline
-    Write-Host "│" -ForegroundColor $bCol
+        # Fila 2: 68 chars base
+        $rem2 = [Math]::Max(0, $script:InnerW - 68)
+        Write-Host ($script:Margin + "│ ") -ForegroundColor $bCol -NoNewline
+        Write-Host "APPS " -ForegroundColor DarkGray -NoNewline
+        Write-Badge "cuentas-1 :8081" $m["ms-cuentas-1"]
+        Write-Host " " -NoNewline
+        Write-Badge "cuentas-2 :8082" $m["ms-cuentas-2"]
+        Write-Host " " -NoNewline
+        Write-Badge "transacciones :8083" $m["ms-transacciones"]
+        Write-Host ((" " * $rem2) + " │") -ForegroundColor $bCol -NoNewline
+        Complete-Row
+    } else {
+        # Modo compacto para ventanas < 78 columnas
+        $rem1 = [Math]::Max(0, $script:InnerW - 57)
+        Write-Host ($script:Margin + "│ ") -ForegroundColor $bCol -NoNewline
+        Write-Host "RED  " -ForegroundColor DarkGray -NoNewline
+        Write-Badge "gw" $m["api-gateway"]
+        Write-Host " " -NoNewline
+        Write-Badge "eureka" $m["eureka-server"]
+        Write-Host "   BD " -ForegroundColor DarkGray -NoNewline
+        Write-Badge "primary" $m["primary"]
+        Write-Host " " -NoNewline
+        Write-Badge "rep1" $m["replica1"]
+        Write-Host " " -NoNewline
+        Write-Badge "rep2" $m["replica2"]
+        Write-Host ((" " * $rem1) + " │") -ForegroundColor $bCol -NoNewline
+        Complete-Row
 
-    Write-Host ("└" + ("─" * 76) + "┘") -ForegroundColor $bCol
+        $rem2 = [Math]::Max(0, $script:InnerW - 50)
+        Write-Host ($script:Margin + "│ ") -ForegroundColor $bCol -NoNewline
+        Write-Host "APPS " -ForegroundColor DarkGray -NoNewline
+        Write-Badge "cuentas-1" $m["ms-cuentas-1"]
+        Write-Host " " -NoNewline
+        Write-Badge "cuentas-2" $m["ms-cuentas-2"]
+        Write-Host " " -NoNewline
+        Write-Badge "transacciones" $m["ms-transacciones"]
+        Write-Host ((" " * $rem2) + " │") -ForegroundColor $bCol -NoNewline
+        Complete-Row
+    }
+
+    Write-CleanLine ("└" + ("─" * ($script:UiW - 2)) + "┘") $bCol
 }
 
 function Update-DockInPlace($Snap = $null) {
@@ -225,37 +416,43 @@ function Update-DockInPlace($Snap = $null) {
 
 function Write-SlideChrome([int]$SlideNum, [int]$ActiveSection, [string]$SlideTitle) {
     Begin-Frame
-    $tabs = @(
-        @{ Id = 1; Label = "[1:Arq]" },
-        @{ Id = 2; Label = "[2:Eur]" },
-        @{ Id = 3; Label = "[3:P2P]" },
-        @{ Id = 4; Label = "[4:Rep]" },
-        @{ Id = 5; Label = "[5:Fal]" },
-        @{ Id = 6; Label = "[6:Fin]" }
-    )
-    $right = ("{0:00}/15 {1}" -f $SlideNum, (Get-ProgressBar $SlideNum 15))
-    $tabsLen = 47
-    $gap = [Math]::Max(1, 74 - $tabsLen - $right.Length)
-    $row2 = Format-Fixed ("► " + $SlideTitle) 74
+    $compact = ($script:InnerW -lt 70)
+    $tabs = if ($compact) {
+        @(@{Id=1;L="[1]"},@{Id=2;L="[2]"},@{Id=3;L="[3]"},@{Id=4;L="[4]"},@{Id=5;L="[5]"},@{Id=6;L="[6]"})
+    } else {
+        @(@{Id=1;L="[1:Arq]"},@{Id=2;L="[2:Eur]"},@{Id=3;L="[3:P2P]"},@{Id=4;L="[4:Rep]"},@{Id=5;L="[5:Fal]"},@{Id=6;L="[6:Fin]"})
+    }
+    $barLen = if ($script:InnerW -ge 88) { 14 } else { 10 }
+    $right = ("{0:00}/15 {1}" -f $SlideNum, (Get-ProgressBar $SlideNum 15 $barLen))
+    $tabsLen = (($tabs | ForEach-Object { $_.L.Length }) | Measure-Object -Sum).Sum + ($tabs.Count - 1)
+    $gap = [Math]::Max(1, $script:InnerW - $tabsLen - $right.Length)
+    $row2 = Format-Fixed ("► " + $SlideTitle) $script:InnerW
 
-    Write-Host ("╔" + ("═" * 76) + "╗") -ForegroundColor DarkCyan
-    Write-Host "║ " -ForegroundColor DarkCyan -NoNewline
+    Write-CleanLine ("╔" + ("═" * ($script:UiW - 2)) + "╗") "DarkCyan"
+    Write-Host ($script:Margin + "║ ") -ForegroundColor DarkCyan -NoNewline
     for ($i = 0; $i -lt $tabs.Count; $i++) {
         $tb = $tabs[$i]
         $col = if ($tb.Id -eq $ActiveSection) { "Yellow" } else { "DarkGray" }
-        Write-Host $tb.Label -ForegroundColor $col -NoNewline
+        Write-Host $tb.L -ForegroundColor $col -NoNewline
         if ($i -lt $tabs.Count - 1) { Write-Host " " -NoNewline }
     }
     Write-Host (" " * $gap) -NoNewline
     Write-Host $right -ForegroundColor Cyan -NoNewline
-    Write-Host " ║" -ForegroundColor DarkCyan
+    Write-Host " ║" -ForegroundColor DarkCyan -NoNewline
+    Complete-Row
 
-    Write-Host "║ " -ForegroundColor DarkCyan -NoNewline
+    Write-Host ($script:Margin + "║ ") -ForegroundColor DarkCyan -NoNewline
     Write-Host $row2 -ForegroundColor White -NoNewline
-    Write-Host " ║" -ForegroundColor DarkCyan
-    Write-Host ("╚" + ("═" * 76) + "╝") -ForegroundColor DarkCyan
+    Write-Host " ║" -ForegroundColor DarkCyan -NoNewline
+    Complete-Row
+    Write-CleanLine ("╚" + ("═" * ($script:UiW - 2)) + "╝") "DarkCyan"
 
     Render-ClusterDock $true
+    $sid = "S$SlideNum"
+    if (-not [Console]::IsOutputRedirected -and $script:LastScreenId -ne $sid) {
+        try { Clear-TailFrom ([Console]::CursorTop) } catch { }
+    }
+    $script:LastScreenId = $sid
 }
 
 function Open-EurekaBrowser {
@@ -296,72 +493,91 @@ function Parse-ConsoleKey($k) {
 
 function Read-SlideKeyLive([bool]$LiveDock = $true) {
     if ([Console]::IsInputRedirected) { return "QUIT" }
-    $lastPoll = [DateTime]::UtcNow
     while ($true) {
         if ([Console]::KeyAvailable) {
             return (Parse-ConsoleKey ([Console]::ReadKey($true)))
         }
-        if ($LiveDock -and (([DateTime]::UtcNow - $lastPoll).TotalMilliseconds -ge 2500)) {
-            $lastPoll = [DateTime]::UtcNow
-            Update-DockInPlace
-        }
-        Start-Sleep -Milliseconds 50
+        try {
+            if ([Console]::WindowWidth -ne $script:WinW -or [Console]::WindowHeight -ne $script:WinH) {
+                return "RESIZE"
+            }
+        } catch { }
+        if ($LiveDock) { Poll-AsyncDock }
+        Start-Sleep -Milliseconds 30
     }
 }
 
 function Wait-SlideFooter([string]$NextLabel = "Siguiente", [bool]$AllowBack = $true) {
-    Write-Host ("─" * 78) -ForegroundColor DarkGray
+    Write-Divider
     if ($AllowBack) {
-        Write-Host ("  [ESPACIO/→] {0}   [←/Backspace] Anterior" -f $NextLabel) -ForegroundColor Green
+        $navLine = "  [ESPACIO/→] {0}   [←/Backspace] Anterior" -f $NextLabel
+        if ($navLine.Length -gt $script:UiW) {
+            $navLine = "  [ESPACIO/→] {0}   [←] Anterior" -f $NextLabel
+        }
+        Write-CleanLine $navLine "Green"
     } else {
-        Write-Host ("  [ESPACIO/→] {0}" -f $NextLabel) -ForegroundColor Green
+        Write-CleanLine ("  [ESPACIO/→] {0}" -f $NextLabel) "Green"
     }
-    Write-Host "  [1-6] Seccion   [R] Actualizar   [B] Eureka   [U] Utilidades   [Q] Salir" -ForegroundColor DarkGray
+    $helpLine = if ($script:UiW -lt 76) {
+        "  [1-6] Sec   [R] Re-ejec   [B] Eureka   [U] Utils   [Q] Salir"
+    } else {
+        "  [1-6] Seccion   [R] Actualizar   [B] Eureka   [U] Utilidades   [Q] Salir"
+    }
+    Write-CleanLine $helpLine "DarkGray"
     End-Frame
     while ($true) {
         $act = Read-SlideKeyLive $true
-        if ($act -eq "EUREKA") {
-            Open-EurekaBrowser
-            continue
-        }
-        if ($act -eq "DOCK_REFRESH") {
-            Update-DockInPlace
-            continue
-        }
+        if ($act -eq "EUREKA") { Open-EurekaBrowser; continue }
+        if ($act -eq "DOCK_REFRESH") { Update-DockInPlace (Get-ContainerMapSync); continue }
         return $act
     }
 }
 
 function Invoke-ApiRequest([string]$Method, [string]$Url, [string]$JsonBody = "", [int]$TimeoutSec = 10) {
-    if (-not (Test-Path $script:TmpDir)) {
-        New-Item -ItemType Directory -Path $script:TmpDir -Force | Out-Null
-    }
-    $curlArgs = @("-s", "--max-time", "$TimeoutSec", "-o", $script:BodyFile, "-D", $script:HeadersFile, "-w", "%{http_code}", "-X", $Method, $Url)
-    if ($JsonBody) {
-        [IO.File]::WriteAllText($script:JsonFile, $JsonBody, $script:Utf8NoBom)
-        $curlArgs += @("-H", "Content-Type: application/json", "--data-binary", "@$($script:JsonFile)")
-    } else {
-        $curlArgs += @("-H", "Accept: application/json")
-    }
-    $code = (& curl.exe @curlArgs 2>$null)
-    if (-not $code) { $code = "000" }
     $headers = @{}
-    if (Test-Path $script:HeadersFile) {
-        foreach ($line in (Get-Content -LiteralPath $script:HeadersFile -Encoding UTF8 -ErrorAction SilentlyContinue)) {
-            if ($line -match '^([^:]+):\s*(.*)$') {
-                $headers[$Matches[1].Trim().ToLowerInvariant()] = $Matches[2].Trim()
-            }
-        }
-    }
     $rawBody = ""
     $bodyObj = $null
-    if (Test-Path $script:BodyFile) {
-        $rawBody = Get-Content -LiteralPath $script:BodyFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-        if ($rawBody) {
-            try { $bodyObj = $rawBody | ConvertFrom-Json } catch { }
+    $code = "000"
+    try {
+        $req = [System.Net.HttpWebRequest]::Create($Url)
+        $req.Method = $Method
+        $req.Timeout = $TimeoutSec * 1000
+        $req.ReadWriteTimeout = $TimeoutSec * 1000
+        $req.Accept = "application/json"
+        if ($JsonBody) {
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($JsonBody)
+            $req.ContentType = "application/json; charset=utf-8"
+            $req.ContentLength = $bytes.Length
+            $rs = $req.GetRequestStream()
+            $rs.Write($bytes, 0, $bytes.Length)
+            $rs.Close()
         }
-    }
-    return @{ Code = "$code".Trim(); Headers = $headers; Body = $bodyObj; Raw = $rawBody }
+        $resp = $null
+        try {
+            $resp = [System.Net.HttpWebResponse]$req.GetResponse()
+        } catch [System.Net.WebException] {
+            if ($_.Exception.Response) {
+                $resp = [System.Net.HttpWebResponse]$_.Exception.Response
+            }
+        }
+        if ($resp) {
+            $code = [string]([int]$resp.StatusCode)
+            foreach ($hk in $resp.Headers.AllKeys) {
+                $headers[$hk.ToLowerInvariant()] = $resp.Headers[$hk]
+            }
+            $stream = $resp.GetResponseStream()
+            if ($stream) {
+                $sr = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
+                $rawBody = $sr.ReadToEnd()
+                $sr.Close()
+            }
+            $resp.Close()
+            if ($rawBody) {
+                try { $bodyObj = $rawBody | ConvertFrom-Json } catch { }
+            }
+        }
+    } catch { }
+    return @{ Code = $code; Headers = $headers; Body = $bodyObj; Raw = $rawBody }
 }
 
 function Get-SaldoInfo {
@@ -376,28 +592,64 @@ function Invoke-EnsureEnv {
     if (-not (Test-Path $envPath)) {
         if (Test-Path $exPath) {
             Copy-Item -LiteralPath $exPath -Destination $envPath
-            Write-Host "  [OK] Archivo .env creado desde .env.example." -ForegroundColor Green
+            Write-Host ($script:Margin + "  [OK] Archivo .env creado desde .env.example.") -ForegroundColor Green
             return $true
         }
-        Write-Host "  [ERROR] No existe .env ni .env.example." -ForegroundColor Red
+        Write-Host ($script:Margin + "  [ERROR] No existe .env ni .env.example.") -ForegroundColor Red
         return $false
     }
     return $true
 }
 
+function Write-ThreeColCards([string[]]$Titles, [string[]]$Colors, [object[]]$Rows) {
+    $cwBase = [Math]::Floor(($script:UiW - 2) / 3)
+    $rem = ($script:UiW - 2) - ($cwBase * 3)
+    $cws = @(
+        ($cwBase + $(if ($rem -ge 1) { 1 } else { 0 })),
+        ($cwBase + $(if ($rem -ge 2) { 1 } else { 0 })),
+        $cwBase
+    )
+    $gap = " "
+    $lineTop = ""
+    $lineBot = ""
+    for ($i = 0; $i -lt 3; $i++) {
+        $cw = $cws[$i]; $ci = $cw - 2
+        $t = " " + $Titles[$i] + " "
+        if ($t.Length -gt ($cw - 3)) { $t = $t.Substring(0, $cw - 3) }
+        $fill = [Math]::Max(1, ($cw - 3) - $t.Length)
+        $lineTop += "┌─" + $t + ("─" * $fill) + "┐"
+        $lineBot += "└" + ("─" * $ci) + "┘"
+        if ($i -lt 2) { $lineTop += $gap; $lineBot += $gap }
+    }
+    Write-CleanLine $lineTop "Cyan"
+    foreach ($r in $Rows) {
+        Write-Host $script:Margin -NoNewline
+        for ($i = 0; $i -lt 3; $i++) {
+            $bcol = $Colors[$i]; $ci = $cws[$i] - 2
+            Write-Host "│" -ForegroundColor $bcol -NoNewline
+            Write-Host (Format-Fixed $r[$i] $ci) -ForegroundColor White -NoNewline
+            Write-Host "│" -ForegroundColor $bcol -NoNewline
+            if ($i -lt 2) { Write-Host $gap -NoNewline }
+        }
+        Complete-Row
+    }
+    Write-CleanLine $lineBot "DarkGray"
+}
+
 # --- Panel de Utilidades ---
 
 function Show-CleanPrep {
+    $script:LastScreenId = "PREP"
     Begin-Frame $true
-    Write-Host ("╔" + ("═" * 76) + "╗") -ForegroundColor DarkYellow
-    Write-Host ("║ " + (Format-Fixed "REINICIO LIMPIO DEL ENTORNO (down -v + up -d --build)" 74) + " ║") -ForegroundColor Yellow
-    Write-Host ("╚" + ("═" * 76) + "╝") -ForegroundColor DarkYellow
-    Write-Host ""
+    Write-CleanLine ("╔" + ("═" * ($script:UiW - 2)) + "╗") "DarkYellow"
+    Write-CleanLine ("║ " + (Format-Fixed "REINICIO LIMPIO DEL ENTORNO (down -v + up -d --build)" $script:InnerW) + " ║") "Yellow"
+    Write-CleanLine ("╚" + ("═" * ($script:UiW - 2)) + "╝") "DarkYellow"
+    Write-BlankLine
     if (-not (Invoke-EnsureEnv)) {
         [void](Wait-SlideFooter "Volver" $false)
         return
     }
-    Write-Host "  $ docker compose down -v && docker compose up -d --build" -ForegroundColor Cyan
+    Write-CleanLine "  $ docker compose down -v && docker compose up -d --build" "Cyan"
     & docker compose down -v
     & docker compose up -d --build
     if ($LASTEXITCODE -ne 0) {
@@ -408,7 +660,7 @@ function Show-CleanPrep {
     Write-Host "`n  Esperando que los 8 contenedores esten healthy..." -ForegroundColor Yellow
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     while ($sw.Elapsed.TotalSeconds -lt 240) {
-        $snap = Get-ContainerMap
+        $snap = Get-ContainerMapSync
         Write-Host ("`r  [{0,3}s] Healthy: {1}/8   " -f [int]$sw.Elapsed.TotalSeconds, $snap.Healthy) -NoNewline -ForegroundColor Cyan
         if ($snap.Healthy -ge 8) {
             Write-Host "`n  [OK] Los 8 contenedores estan healthy!" -ForegroundColor Green
@@ -430,23 +682,27 @@ function Show-CleanPrep {
 
 function Show-UtilsPanel {
     $script:FirstFrame = $true
+    $script:LastScreenId = "UTILS"
     while ($true) {
         Begin-Frame
-        Write-Host ("╔" + ("═" * 76) + "╗") -ForegroundColor DarkCyan
-        Write-Host ("║ " + (Format-Fixed "UTILIDADES DEL ENTORNO Y VERIFICACION" 74) + " ║") -ForegroundColor Cyan
-        Write-Host ("╚" + ("═" * 76) + "╝") -ForegroundColor DarkCyan
+        Write-CleanLine ("╔" + ("═" * ($script:UiW - 2)) + "╗") "DarkCyan"
+        Write-Host ($script:Margin + "║ ") -ForegroundColor DarkCyan -NoNewline
+        Write-Host (Format-Fixed "UTILIDADES DEL ENTORNO Y VERIFICACION" $script:InnerW) -ForegroundColor Cyan -NoNewline
+        Write-Host " ║" -ForegroundColor DarkCyan -NoNewline
+        Complete-Row
+        Write-CleanLine ("╚" + ("═" * ($script:UiW - 2)) + "╝") "DarkCyan"
         Render-ClusterDock $true
         $sal = Get-SaldoInfo
-        Write-Host ""
+        Write-BlankLine
         if (-not (Test-Path (Join-Path $RepoDir ".env"))) {
-            Write-Host "  [AVISO] Falta .env en el repositorio (pulsa [C] o [P])." -ForegroundColor Yellow
+            Write-CleanLine "  [AVISO] Falta .env en el repositorio (pulsa [C] o [P])." "Yellow"
         }
         if ($sal) {
             $cons = [decimal]$sal.consumidoHoy
             $sc = if ($cons -eq 0) { "Green" } else { "Yellow" }
-            Write-Host ('  Cuenta {0}: saldo=${1} | consumidoHoy=${2} / ${3}' -f $Origen, (Format-Money $sal.saldo), (Format-Money $sal.consumidoHoy), (Format-Money $sal.limiteDiario)) -ForegroundColor $sc
+            Write-CleanLine ('  Cuenta {0}: saldo=${1} | consumidoHoy=${2} / ${3}' -f $Origen, (Format-Money $sal.saldo), (Format-Money $sal.consumidoHoy), (Format-Money $sal.limiteDiario)) $sc
         }
-        Write-Host ""
+        Write-BlankLine
         Write-BoxTop "ACCIONES DISPONIBLES" "DarkCyan"
         Write-BoxLine "[P] Reinicio limpio (down -v + up -d --build + abrir Eureka)" "Yellow" "DarkCyan"
         Write-BoxLine "[S] Arrancar contenedores detenidos (docker compose start)" "White" "DarkCyan"
@@ -460,11 +716,12 @@ function Show-UtilsPanel {
 
         $act = Read-SlideKeyLive $true
         switch ($act) {
+            "RESIZE"       { continue }
             "PREP"         { Show-CleanPrep }
-            "STARTALL"     { Begin-Frame $true; [void](Invoke-EnsureEnv); & docker compose start; [void](Wait-SlideFooter "Volver" $false); $script:FirstFrame = $true }
+            "STARTALL"     { Begin-Frame $true; [void](Invoke-EnsureEnv); & docker compose start; [void](Get-ContainerMapSync); [void](Wait-SlideFooter "Volver" $false); $script:FirstFrame = $true }
             "EUREKA"       { Open-EurekaBrowser }
-            "DOCK_REFRESH" { Update-DockInPlace }
-            "ENV"          { [void](Invoke-EnsureEnv); Start-Sleep -Milliseconds 600 }
+            "DOCK_REFRESH" { Update-DockInPlace (Get-ContainerMapSync) }
+            "ENV"          { [void](Invoke-EnsureEnv); Start-Sleep -Milliseconds 500 }
             "SUITE" {
                 Begin-Frame $true
                 $ps1 = Join-Path $RepoDir "docs\api\curl-p01-p08.ps1"
@@ -485,35 +742,69 @@ function Show-UtilsPanel {
 
 function Slide-01([bool]$UseCache = $false) {
     Write-SlideChrome 1 1 "Arquitectura del Sistema · 8 Contenedores Docker"
-    Write-Host ""
+    Write-BlankLine
     Write-BoxTop "FLUJO Y TOPOLOGIA DE RED (wallet-net)" "DarkCyan"
-    Write-BoxLine "Cliente ─:8080─▶ [api-gateway] ◀──registro/latido 5s──▶ [eureka :8761]" "Cyan" "DarkCyan"
-    Write-BoxLine "                      │ lb:// Round-Robin" "DarkGray" "DarkCyan"
-    Write-BoxLine "        ┌─────────────┼─────────────┐" "DarkGray" "DarkCyan"
-    Write-BoxLine "        ▼             ▼             ▼" "DarkGray" "DarkCyan"
-    Write-BoxLine " [ms-cuentas-1] [ms-cuentas-2] [ms-transacciones]  (esquemas aislados:" "Green" "DarkCyan"
-    Write-BoxLine "     :8081          :8082            :8083          cuentas_db / tx_db)" "Green" "DarkCyan"
-    Write-BoxLine "        └─────────────┬─────────────┘  Enrutador JDBC (@UsarNodo)" "Magenta" "DarkCyan"
-    Write-BoxLine "     Escritura / RYOW │         Lecturas Ordinarias" "DarkGray" "DarkCyan"
-    Write-BoxLine "                      ▼" "DarkGray" "DarkCyan"
-    Write-BoxLine "       [primary :5432 R/W] ══WAL══▶ [replica1 :5433] + [replica2 :5434]" "Blue" "DarkCyan"
+    if ($script:InnerW -ge 71) {
+        $pad = if ($script:InnerW -ge 86) { "      " } else { "" }
+        Write-BoxLine ($pad + "Cliente ─:8080─► [api-gateway] ◄──registro/latido 5s──► [eureka :8761]") "Cyan" "DarkCyan"
+        Write-BoxLine ($pad + "                      │ lb:// Round-Robin") "DarkGray" "DarkCyan"
+        Write-BoxLine ($pad + "        ┌─────────────┼─────────────┐") "DarkGray" "DarkCyan"
+        Write-BoxLine ($pad + "        ▼             ▼             ▼") "DarkGray" "DarkCyan"
+        Write-BoxLine ($pad + " [ms-cuentas-1] [ms-cuentas-2] [ms-transacciones]  (esquemas aislados:") "Green" "DarkCyan"
+        Write-BoxLine ($pad + "     :8081          :8082            :8083          cuentas_db / tx_db)") "Green" "DarkCyan"
+        Write-BoxLine ($pad + "        └─────────────┬─────────────┘  Enrutador JDBC (@UsarNodo)") "Magenta" "DarkCyan"
+        Write-BoxLine ($pad + "     Escritura / RYOW │         Lecturas Ordinarias") "DarkGray" "DarkCyan"
+        Write-BoxLine ($pad + "                      ▼") "DarkGray" "DarkCyan"
+        Write-BoxLine ($pad + "       [primary :5432 R/W] ══WAL══► [replica1 :5433] + [replica2 :5434]") "Blue" "DarkCyan"
+    } else {
+        Write-BoxLine "Cliente :8080►[gateway]◄─5s─►[eureka :8761]" "Cyan" "DarkCyan"
+        Write-BoxLine "                  │ lb:// Round-Robin" "DarkGray" "DarkCyan"
+        Write-BoxLine "       ┌──────────┼──────────┐" "DarkGray" "DarkCyan"
+        Write-BoxLine "       ▼          ▼          ▼" "DarkGray" "DarkCyan"
+        Write-BoxLine " [cuentas-1] [cuentas-2] [ms-tx]  (cuentas_db / tx_db)" "Green" "DarkCyan"
+        Write-BoxLine "     :8081      :8082     :8083" "Green" "DarkCyan"
+        Write-BoxLine "       └──────────┬──────────┘  @UsarNodo JDBC" "Magenta" "DarkCyan"
+        Write-BoxLine "   Write / RYOW   │    Lecturas" "DarkGray" "DarkCyan"
+        Write-BoxLine "                  ▼" "DarkGray" "DarkCyan"
+        Write-BoxLine " [primary:5432]═WAL═►[rep1:5433]+[rep2:5434]" "Blue" "DarkCyan"
+    }
     Write-BoxBottom "DarkCyan"
+    $takeaway = if ($script:InnerW -ge 70) { "  ● Gateway balancea HTTP; Postgres separa escrituras y lecturas." } else { "  ● Gateway balancea HTTP; Postgres separa write/read." }
+    Write-CleanLine $takeaway "DarkGray"
     return (Wait-SlideFooter "Detalle del clúster")
 }
 
 function Slide-02([bool]$UseCache = $false) {
     Write-SlideChrome 2 1 "Clúster Docker Compose · Estado de Servicios"
-    Write-Host ""
+    Write-BlankLine
+    if (-not $UseCache -or -not $script:CachePsLines) {
+        $raw = & docker compose ps -a --format "{{.Name}}|{{.Service}}|{{.Status}}|{{.Ports}}" 2>$null
+        if ($LASTEXITCODE -eq 0 -and $raw) {
+            $script:CachePsLines = @($raw)
+        } else {
+            $script:CachePsLines = @()
+        }
+    }
     Write-BoxTop "TELEMETRIA DE CONTENEDORES (docker compose ps)" "Cyan"
-    $out = & docker compose ps --format "table {{.Name}}\t{{.Service}}\t{{.Status}}\t{{.Ports}}" 2>$null
-    $count = 0
-    if ($LASTEXITCODE -eq 0 -and $out) {
-        foreach ($line in $out) {
-            if (-not $line.Trim()) { continue }
-            $count++
-            if ($line -match 'healthy') { Write-BoxLine $line "Green" "Cyan" }
-            elseif ($line -match '^NAME') { Write-BoxLine $line "Cyan" "Cyan" }
-            else { Write-BoxLine $line "Yellow" "Cyan" }
+    if ($script:CachePsLines.Count -gt 0) {
+        $showPorts = ($script:InnerW -ge 72)
+        if ($showPorts) {
+            Write-BoxLine ("{0,-18} {1,-16} {2,-23} {3}" -f "CONTENEDOR", "SERVICIO", "ESTADO", "PUERTOS") "Cyan" "Cyan"
+        } else {
+            Write-BoxLine ("{0,-18} {1,-16} {2}" -f "CONTENEDOR", "SERVICIO", "ESTADO") "Cyan" "Cyan"
+        }
+        foreach ($line in $script:CachePsLines) {
+            if (-not $line -or ($line -notmatch '\|')) { continue }
+            $p = $line -split '\|', 4
+            $st = ($p[2] -replace 'About an hour', '~1h' -replace '\(health: starting\)', '(starting)' -replace 'Less than a second', '<1s')
+            $ports = ($p[3] -replace '0\.0\.0\.0:', '' -replace '\[::\]:\d+->\d+/tcp,?\s*', '' -replace '/tcp', '')
+            $col = if ($st -match 'healthy') { "Green" } else { "Yellow" }
+            $row = if ($showPorts) {
+                "{0,-18} {1,-16} {2,-23} {3}" -f $p[0], $p[1], $st, $ports
+            } else {
+                "{0,-18} {1,-16} {2}" -f $p[0], $p[1], $st
+            }
+            Write-BoxLine $row $col "Cyan"
         }
     } else {
         Write-BoxLine "No se pudo consultar docker compose (verifica Docker Desktop)." "Red" "Cyan"
@@ -524,19 +815,27 @@ function Slide-02([bool]$UseCache = $false) {
 
 function Slide-03([bool]$UseCache = $false) {
     Write-SlideChrome 3 2 "Descubrimiento Dinámico con Netflix Eureka"
-    Write-Host ""
+    Write-BlankLine
     Write-BoxTop "ARQUITECTURA DE DESCUBRIMIENTO" "DarkCyan"
-    Write-BoxLine "● Auto-registro al arrancar y latido (heartbeat) cada 5 segundos." "White" "DarkCyan"
-    Write-BoxLine "● API Gateway resuelve por nombre logico (lb://ms-cuentas), sin IPs fijas." "White" "DarkCyan"
+    Write-BoxLine "● Auto-registro al iniciar y latido (heartbeat) cada 5s." "White" "DarkCyan"
+    Write-BoxLine "● Gateway resuelve via lb://ms-cuentas, sin IPs fijas." "White" "DarkCyan"
     Write-BoxBottom "DarkCyan"
-    Write-Host ""
+    Write-BlankLine
+    if (-not $UseCache -or -not $script:CacheEureka) {
+        $script:CacheEureka = Invoke-ApiRequest "GET" "$Eureka/eureka/apps" "" 5
+    }
+    $r = $script:CacheEureka
     Write-BoxTop "REGISTRO EUREKA EN VIVO (:8761/eureka/apps)" "Green"
-    $r = Invoke-ApiRequest "GET" "$Eureka/eureka/apps" "" 5
     if ($r.Code -eq "200" -and $r.Body -and $r.Body.applications) {
         foreach ($app in $r.Body.applications.application) {
-            $insts = @($app.instance | ForEach-Object { "$($_.instanceId) [$($_.status)]" }) -join "  ,  "
             $c = if ($app.name -eq "MS-CUENTAS") { "Green" } else { "Cyan" }
-            Write-BoxLine ("{0,-17} -> {1}" -f $app.name, $insts) $c "Green"
+            $first = $true
+            foreach ($inst in @($app.instance)) {
+                $iid = "$($inst.instanceId)" -replace ':([0-9a-f]{6})[0-9a-f]{26}(?=:|$)', ':$1'
+                $prefix = if ($first) { "{0,-16} -> " -f $app.name } else { "                    " }
+                $first = $false
+                Write-BoxLine ("{0}{1} [{2}]" -f $prefix, $iid, $inst.status) $c "Green"
+            }
         }
     } else {
         Write-BoxLine ("No responde Eureka en {0} (HTTP {1})." -f $Eureka, $r.Code) "Red" "Green"
@@ -547,36 +846,52 @@ function Slide-03([bool]$UseCache = $false) {
 
 function Slide-04([bool]$UseCache = $false) {
     Write-SlideChrome 4 2 "Balanceo de Carga HTTP · Round Robin"
-    Write-Host ""
-    Write-Host ("  20 peticiones consecutivas a GET {0}/api/cuentas/instancia" -f $Gateway) -ForegroundColor DarkCyan
-    Write-Host ""
-    $results = @()
-    for ($i = 1; $i -le 20; $i++) {
-        $r = Invoke-ApiRequest "GET" "$Gateway/api/cuentas/instancia" "" 5
-        $inst = if ($r.Headers["x-service-instance"]) { $r.Headers["x-service-instance"] } else { "sin-cabecera" }
-        $results += [pscustomobject]@{ Code = $r.Code; Instance = $inst }
+    Write-BlankLine
+    $sub = if ($script:InnerW -ge 64) { "  20 peticiones a GET {0}/api/cuentas/instancia" -f $Gateway } else { "  20x GET /api/cuentas/instancia" }
+    Write-CleanLine $sub "DarkCyan"
+    Write-BlankLine
+    if (-not $UseCache -or -not $script:CacheBalanceo) {
+        $res = @()
+        for ($i = 1; $i -le 20; $i++) {
+            $r = Invoke-ApiRequest "GET" "$Gateway/api/cuentas/instancia" "" 5
+            $inst = if ($r.Headers["x-service-instance"]) { $r.Headers["x-service-instance"] } else { "sin-cabecera" }
+            $res += [pscustomobject]@{ Code = $r.Code; Instance = $inst }
+        }
+        $script:CacheBalanceo = $res
     }
+    $results = $script:CacheBalanceo
     $okCount = @($results | Where-Object Code -eq "200").Count
+    $errCount = 20 - $okCount
+    $barW = [Math]::Min(30, [Math]::Max(8, $script:InnerW - 42))
+
     Write-BoxTop "DISTRIBUCION POR INSTANCIA" "Green"
     $grouped = $results | Group-Object Code, Instance | Sort-Object Name
     foreach ($g in $grouped) {
         $f = $g.Group[0]
         $pct = [int][Math]::Round(($g.Count / 20.0) * 100)
-        $bar = ("█" * [Math]::Min($g.Count, 20)).PadRight(20, "░")
+        $filled = [Math]::Min($barW, [int][Math]::Round(($g.Count / 20.0) * $barW))
+        $bar = ("█" * $filled).PadRight($barW, "░")
         $c = if ($f.Code -eq "200") { if ($f.Instance -like "ms-cuentas-2*") { "Cyan" } else { "Green" } } else { "Red" }
         Write-BoxLine ("{0,-20} [{1}]  {2}  {3,2}/20 ({4,3}%)" -f $f.Instance, $f.Code, $bar, $g.Count, $pct) $c "Green"
     }
     Write-BoxBottom "Green"
-    $pCol = if ($okCount -eq 20) { "Green" } else { "Red" }
-    Write-Host ("  [ RESULTADO: {0}/20 RESPUESTAS 200 OK · REPARTO ROUND ROBIN ]" -f $okCount) -ForegroundColor $pCol
+    $pCol = if ($errCount -eq 0) { "Green" } else { "Red" }
+    Write-CleanLine ("  [ RESULTADO: {0}/20 OK · ERRORES: {1} · REPARTO ROUND ROBIN ]" -f $okCount, $errCount) $pCol
     return (Wait-SlideFooter "3. Comunicación entre servicios")
 }
 
 function Slide-05([bool]$UseCache = $false) {
     Write-SlideChrome 5 3 "Orquestación P2P entre Microservicios · Transferencia"
-    Write-Host ""
-    Write-Host "  Cliente ─POST :8080─▶ [ms-transacciones :8083] ─Eureka─▶ [ms-cuentas] ─ACID─▶ PRIMARY" -ForegroundColor Cyan
-    Write-Host ""
+    Write-BlankLine
+    $flow = if ($script:InnerW -ge 88) {
+        "  Cliente ─POST :8080─► [ms-transacciones :8083] ─Eureka─► [ms-cuentas] ─ACID─► PRIMARY"
+    } elseif ($script:InnerW -ge 66) {
+        "  POST :8080 ─► ms-transacciones ─► ms-cuentas ─ACID─► PRIMARY"
+    } else {
+        "  POST :8080 ► ms-tx ► ms-cuentas ► PRIMARY"
+    }
+    Write-CleanLine $flow "Cyan"
+    Write-BlankLine
 
     if (-not $UseCache -or -not $script:CacheTxOk) {
         $payload = @{ celularOrigen = $Origen; celularDestino = $Destino; monto = 25; motivo = "Transferencia P2P" } | ConvertTo-Json -Compress
@@ -594,23 +909,29 @@ function Slide-05([bool]$UseCache = $false) {
     if ($nbd -and $nbd -ne "-") { $script:LastTxNodo = $nbd }
     if ($cod -and $cod -ne "-") { $script:LastTxCodigo = $cod }
 
+    $nbdDisp = if ($script:InnerW -lt 66) { $nbd -replace 'recovery=', 'rec=' } else { $nbd }
+    $nbdLbl  = if ($script:InnerW -lt 66) { "Nodo BD            : " } else { "Nodo Base de Datos : " }
+
     Write-BoxTop ("COMPROBANTE DE TRANSFERENCIA  [ HTTP " + $r.Code + " ]") $bCol
     Write-BoxLine ("Estado / Mensaje   : {0}" -f $msg) $bCol $bCol
-    Write-BoxLine ("Comprobante        : {0}       Monto: $25.00 ({1} -> {2})" -f $cod, $Origen, $Destino) "White" $bCol
-    Write-BoxLine ('Nuevo Saldo Origen : ${0}' -f $sal) "White" $bCol
-    Write-BoxLine ("Instancia Cuentas  : {0}  (resuelta via Eureka)" -f $ic) "Cyan" $bCol
-    Write-BoxLine ("Nodo Base de Datos : {0}" -f $nbd) "Yellow" $bCol
+    Write-BoxLine ('Comprobante        : {0}  (Monto: $25.00)' -f $cod) "White" $bCol
+    Write-BoxLine ('Saldo Origen Post. : ${0}  ({1} -> {2})' -f $sal, $Origen, $Destino) "White" $bCol
+    Write-BoxLine ("Instancia Cuentas  : {0}" -f $ic) "Cyan" $bCol
+    Write-BoxLine ($nbdLbl + $nbdDisp) "Yellow" $bCol
     Write-BoxLine ("Politica Enrutado  : {0}" -f $pol) "White" $bCol
     Write-BoxBottom $bCol
-    Write-Host "  ● Debito y credito ejecutados en una sola transaccion ACID con bloqueo ordenado." -ForegroundColor DarkGray
-    return (Wait-SlideFooter "Validación de saldo insuficiente")
+    $acidNote = if ($script:InnerW -ge 68) { "  ● Debito y credito en una sola transaccion ACID con bloqueo ordenado." } else { "  ● Debito/credito en 1 transaccion ACID con bloqueo ordenado." }
+    Write-CleanLine $acidNote "DarkGray"
+    return (Wait-SlideFooter "Validación saldo insuficiente")
 }
 
 function Slide-06([bool]$UseCache = $false) {
     Write-SlideChrome 6 3 "Validación de Reglas de Negocio · Error Controlado"
-    Write-Host ""
-    Write-Host ("  Escritura previa ({0}) -> {1}" -f $script:LastTxCodigo, $script:LastTxNodo) -ForegroundColor DarkCyan
-    Write-Host ""
+    Write-BlankLine
+    $prevNod = Format-NodeForWidth $script:LastTxNodo
+    $prevTxt = if ($script:InnerW -ge 74) { "  Escritura previa ({0}) -> {1}" -f $script:LastTxCodigo, $prevNod } else { "  Escritura ({0}) -> {1}" -f $script:LastTxCodigo, $prevNod }
+    Write-CleanLine $prevTxt "DarkCyan"
+    Write-BlankLine
 
     if (-not $UseCache -or -not $script:CacheTxErr) {
         $payload = @{ celularOrigen = $Origen; celularDestino = $Destino; monto = 9999; motivo = "Prueba limite" } | ConvertTo-Json -Compress
@@ -620,17 +941,19 @@ function Slide-06([bool]$UseCache = $false) {
     $msg = if ($r.Body) { $r.Body.mensaje } else { "Sin respuesta ($($r.Code))" }
     $nbd = if ($r.Body -and $r.Body.auditoriaTecnica) { $r.Body.auditoriaTecnica.nodoBaseDatos } else { "-" }
     $col = if ($r.Code -eq "409") { "Yellow" } else { "Red" }
+    $msgLbl = if ($script:InnerW -lt 72) { "Mensaje  : " } else { "Mensaje devuelto   : " }
 
     Write-BoxTop ("RECHAZO CONTROLADO  [ HTTP " + $r.Code + " ]") $col
-    Write-BoxLine ("Mensaje devuelto   : {0}" -f $msg) $col $col
-    Write-BoxLine "Monto solicitado   : $9999.00  (supera saldo disponible)" "White" $col
+    Write-BoxLine ($msgLbl + $msg) $col $col
+    Write-BoxLine 'Monto solicitado   : $9999.00  (supera saldo disponible)' "White" $col
     Write-BoxLine "Integridad ACID    : Transaccion revertida; saldos intactos" "Green" $col
-    Write-BoxLine ("Auditoria nodoBD   : {0}" -f $nbd) "Cyan" $col
+    Write-BoxLine ("Auditoria nodoBD   : {0}" -f (Format-NodeForWidth $nbd)) "Cyan" $col
     Write-BoxBottom $col
     return (Wait-SlideFooter "4. Persistencia replicada")
 }
 
-function Invoke-LecturasRender([string]$BorderCol = "Cyan") {
+function Invoke-LecturasFetch {
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $results = @()
     for ($i = 1; $i -le 10; $i++) {
         foreach ($path in @("cuentas/$Origen/contactos", "transacciones/historial/$Origen")) {
@@ -640,43 +963,81 @@ function Invoke-LecturasRender([string]$BorderCol = "Cyan") {
             $results += [pscustomobject]@{ Code = $r.Code; Node = $node; Fallback = $fb }
         }
     }
+    $sw.Stop()
+    return @{ Results = $results; Sec = [string]::Format($script:Inv, "{0:F2}", $sw.Elapsed.TotalSeconds) }
+}
+
+function Format-NodeForWidth([string]$Node) {
+    if ($script:InnerW -ge 72) { return $Node }
+    return ($Node -replace '\([^)]*recovery=([^)]+)\)', '(rec=$1)' -replace ',\s*', ' ')
+}
+
+function Render-LecturasFromCache($Data, [string]$BorderCol = "Cyan") {
+    $results = $Data.Results
     $okCount = @($results | Where-Object Code -eq "200").Count
+    $errList = @($results | Where-Object Code -ne "200")
     $fbCount = @($results | Where-Object Fallback -eq "true").Count
+    $errDetail = "0"
+    if ($errList.Count -gt 0) {
+        $errDetail = (@($errList | Group-Object Code | ForEach-Object { "HTTP $($_.Name) x$($_.Count)" }) -join ", ")
+    }
+    $maxNodeLen = 20
+    foreach ($it in $results) {
+        $dn = (Format-NodeForWidth $it.Node).Length
+        if ($dn -gt $maxNodeLen) { $maxNodeLen = $dn }
+    }
+    $barW = [Math]::Min(18, [Math]::Max(4, $script:InnerW - 25 - $maxNodeLen))
     Write-BoxTop "20 LECTURAS ORDINARIAS (contactos + historial)" $BorderCol
     $grouped = $results | Group-Object Code, Node, Fallback | Sort-Object Name
     foreach ($g in $grouped) {
         $f = $g.Group[0]
-        $bar = ("█" * [Math]::Min($g.Count, 12)).PadRight(12, "░")
+        $filled = [Math]::Min($barW, [int][Math]::Round(($g.Count / 20.0) * $barW))
+        $bar = ("█" * $filled).PadRight($barW, "░")
         $c = if ($f.Code -ne "200") { "Red" } elseif ($f.Fallback -eq "true") { "Yellow" } else { "Green" }
-        Write-BoxLine ("{0,2}/20 [{1}] {2}  {3}  fb={4}" -f $g.Count, $f.Code, $bar, $f.Node, $f.Fallback) $c $BorderCol
+        Write-BoxLine ("{0,2}/20 [{1}] {2}  {3}  fb={4}" -f $g.Count, $f.Code, $bar, (Format-NodeForWidth $f.Node), $f.Fallback) $c $BorderCol
     }
     Write-BoxBottom $BorderCol
-    return @{ Ok = $okCount; Fallback = $fbCount }
+    return @{ Ok = $okCount; Err = $errList.Count; ErrDetail = $errDetail; Fallback = $fbCount; Sec = $Data.Sec }
 }
 
 function Slide-07([bool]$UseCache = $false) {
     Write-SlideChrome 7 4 "Enrutamiento de Base de Datos · Primario vs Réplicas"
-    Write-Host ""
-    Write-Host ("  Escrituras -> {0}  |  Lecturas -> REPLICA_1 / REPLICA_2" -f $script:LastTxNodo) -ForegroundColor DarkCyan
-    Write-Host ""
-    $stats = Invoke-LecturasRender "Green"
-    Write-Host ("  [ {0}/20 LECTURAS 200 OK · REPARTO ROUND ROBIN EN REPLICAS (recovery=true) ]" -f $stats.Ok) -ForegroundColor Green
+    Write-BlankLine
+    $wNod = Format-NodeForWidth $script:LastTxNodo
+    $hdr7 = if ($script:InnerW -ge 80) { "  Escrituras -> {0}  |  Lecturas -> REPLICA_1 / REPLICA_2" -f $wNod } else { "  Write -> {0} | Read -> REP1/REP2" -f $wNod }
+    Write-CleanLine $hdr7 "DarkCyan"
+    Write-BlankLine
+    if (-not $UseCache -or -not $script:CacheLecturas07) {
+        $script:CacheLecturas07 = Invoke-LecturasFetch
+    }
+    $stats = Render-LecturasFromCache $script:CacheLecturas07 "Green"
+    $col = if ($stats.Err -eq 0) { "Green" } else { "Red" }
+    Write-CleanLine ("  [ {0}/20 OK · ERRORES: {1} · REPLICAS (recovery=true) · {2}s ]" -f $stats.Ok, $stats.ErrDetail, $stats.Sec) $col
     return (Wait-SlideFooter "Lectura crítica RYOW")
 }
 
 function Slide-08([bool]$UseCache = $false) {
     Write-SlideChrome 8 4 "Consistencia Inmediata · Read-Your-Own-Writes (RYOW)"
-    Write-Host ""
+    Write-BlankLine
     Write-BoxTop "ARQUITECTURA DE CONSISTENCIA" "DarkCyan"
-    Write-BoxLine "● Las replicas WAL pueden presentar retardo minimo tras una escritura." "White" "DarkCyan"
-    Write-BoxLine "● /saldo-critico enruta al PRIMARIO para garantizar lectura actualizada." "White" "DarkCyan"
+    if ($script:InnerW -ge 68) {
+        Write-BoxLine "● Las replicas WAL pueden presentar retardo minimo tras escribir." "White" "DarkCyan"
+        Write-BoxLine "● /saldo-critico fuerza lectura al PRIMARIO (RYOW garantizado)." "White" "DarkCyan"
+    } else {
+        Write-BoxLine "● Replicas WAL pueden tener retardo minimo tras escribir." "White" "DarkCyan"
+        Write-BoxLine "● /saldo-critico fuerza lectura en PRIMARIO (RYOW)." "White" "DarkCyan"
+    }
     Write-BoxBottom "DarkCyan"
-    Write-Host ""
-    $r = Invoke-ApiRequest "GET" "$Gateway/api/cuentas/$Origen/saldo-critico" "" 5
-    Write-BoxTop ("LECTURA CRITICA  [ GET /api/cuentas/{0}/saldo-critico ]" -f $Origen) "Green"
+    Write-BlankLine
+    if (-not $UseCache -or -not $script:CacheCritico) {
+        $script:CacheCritico = Invoke-ApiRequest "GET" "$Gateway/api/cuentas/$Origen/saldo-critico" "" 5
+    }
+    $r = $script:CacheCritico
+    $boxT8 = if ($script:InnerW -ge 68) { "LECTURA CRITICA  [ GET /api/cuentas/{0}/saldo-critico ]" -f $Origen } else { "LECTURA CRITICA (GET /saldo-critico)" }
+    Write-BoxTop $boxT8 "Green"
     if ($r.Code -eq "200" -and $r.Body) {
         $sal = Format-Money $r.Body.datos.saldo
-        $nbd = $r.Body.auditoriaTecnica.nodoBaseDatos
+        $nbd = Format-NodeForWidth $r.Body.auditoriaTecnica.nodoBaseDatos
         $pol = $r.Body.auditoriaTecnica.politicaEnrutamiento
         Write-BoxLine ('Saldo inmediato    : ${0}' -f $sal) "Green" "Green"
         Write-BoxLine ("Nodo Base de Datos : {0}" -f $nbd) "Cyan" "Green"
@@ -685,57 +1046,60 @@ function Slide-08([bool]$UseCache = $false) {
         Write-BoxLine ("HTTP {0}: {1}" -f $r.Code, $r.Raw) "Red" "Green"
     }
     Write-BoxBottom "Green"
-    return (Wait-SlideFooter "5. Simulación de fallos (Instancia)")
-}
-
-function Start-BackgroundDocker([string]$SubArgs) {
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = "docker"
-    $psi.Arguments = "compose $SubArgs"
-    $psi.WorkingDirectory = $RepoDir
-    $psi.UseShellExecute = $false
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.CreateNoWindow = $true
-    $proc = New-Object System.Diagnostics.Process
-    $proc.StartInfo = $psi
-    [void]$proc.Start()
-    return $proc
+    return (Wait-SlideFooter "5. Simulación de fallos")
 }
 
 function Slide-09([bool]$UseCache = $false) {
     Write-SlideChrome 9 5 "Alta Disponibilidad HTTP · Caída de ms-cuentas-2"
 
-    if ($UseCache -and $script:LastBurstSummary) {
-        Write-Host ""
-        Write-BoxTop "RESUMEN DE ALTA DISPONIBILIDAD" "Cyan"
-        Write-BoxLine $script:LastBurstSummary "Green" "Cyan"
-        Write-BoxLine "Eureka dio de baja la instancia y API Gateway reintento GET sin errores." "White" "Cyan"
-        Write-BoxBottom "Cyan"
+    if ($UseCache -and $script:LastBurstLines.Count -gt 0) {
+        Write-BlankLine
+        $rCol = if ($script:LastBurstLines[0] -match 'Errores:\s*0\b') { "Green" } else { "Yellow" }
+        Write-BoxTop "RESUMEN DE FALLO Y CONVERGENCIA" $rCol
+        foreach ($ln in $script:LastBurstLines) {
+            Write-BoxLine $ln "White" $rCol
+        }
+        Write-BoxBottom $rCol
         return (Wait-SlideFooter "5b. Caída de réplica PostgreSQL")
     }
 
-    # Ventana deslizante fija (sin scroll brusco)
     $phase = 1; $totalReq = 0; $errReq = 0; $c1 = 0; $c2 = 0
+    $errByCode = @{}
     $ring = New-Object System.Collections.Generic.List[object]
     $eventMsg = "Trafico continuo activo contra Gateway :8080"
     $stopProc = $null; $stopDone = $false
     $startProc = $null; $startDone = $false
+    $stopTrigAt = $null; $detectMs = $null; $consecC1 = 0; $streakStart = $null
+    $startTrigAt = $null; $rejoinMs = $null
     $abortAct = $null
-    $lastDockPoll = [DateTime]::UtcNow
 
     $renderBody = {
         if (-not [Console]::IsOutputRedirected) {
             try { [Console]::SetCursorPosition(0, $script:DockRow + 4) } catch { }
         }
-        $statusTxt = switch ($phase) {
-            1 { "Trafico activo (ms-cuentas-1 + ms-cuentas-2)  |  [ESPACIO] Detener :8082" }
-            2 { "ms-cuentas-2 DETENIDA · Failover en Gateway   |  [ESPACIO] Reiniciar :8082" }
-            3 { "Recuperando instancia (~25s JVM)              |  [ESPACIO] Ver resumen" }
+        $statusTxt = if ($script:InnerW -ge 74) {
+            switch ($phase) {
+                1 { "Trafico activo (ms-cuentas-1 + ms-cuentas-2)  |  [ESPACIO] Detener :8082" }
+                2 { "ms-cuentas-2 DETENIDA · Midiendo deteccion  |  [ESPACIO] Reiniciar :8082" }
+                3 { "Recuperando instancia (~25s JVM)              |  [ESPACIO] Ver resumen" }
+            }
+        } else {
+            switch ($phase) {
+                1 { "Activo (:8081 + :8082) | [ESPACIO] Detener :8082" }
+                2 { ":8082 DETENIDA (deteccion) | [ESPACIO] Reiniciar" }
+                3 { "Recuperando JVM (~25s) | [ESPACIO] Ver resumen" }
+            }
+        }
+        $errCodes = if ($errByCode.Count -gt 0) {
+            " [" + ((@($errByCode.Keys | Sort-Object | ForEach-Object { "$_ x$($errByCode[$_])" })) -join ", ") + "]"
+        } else { "" }
+        $totLine = "Total: {0,-4}  cta-1: {1,-4}  cta-2: {2,-4}  Errores: {3}{4}" -f $totalReq, $c1, $c2, $errReq, $errCodes
+        if ($totLine.Length -gt $script:InnerW) {
+            $totLine = "Tot:{0} c1:{1} c2:{2} Err:{3}{4}" -f $totalReq, $c1, $c2, $errReq, $errCodes
         }
         Write-BoxTop "TELEMETRIA EN VIVO (VENTANA FIJA)" "Yellow"
         Write-BoxLine $statusTxt "Yellow" "Yellow"
-        Write-BoxLine ("Peticiones: {0,-4}  ms-cuentas-1: {1,-4}  ms-cuentas-2: {2,-4}  Errores: {3}" -f $totalReq, $c1, $c2, $errReq) $(if ($errReq -eq 0) { "Green" } else { "Red" }) "Yellow"
+        Write-BoxLine $totLine $(if ($errReq -eq 0) { "Green" } else { "Red" }) "Yellow"
         Write-BoxBottom "Yellow"
 
         Write-BoxTop "ULTIMAS PETICIONES" "DarkGray"
@@ -748,37 +1112,56 @@ function Slide-09([bool]$UseCache = $false) {
             }
         }
         Write-BoxBottom "DarkGray"
-        Write-Host ("  " + (Format-Fixed $eventMsg 74)) -ForegroundColor Cyan
+        Write-CleanLine ("  " + (Format-Fixed $eventMsg $script:InnerW)) "Cyan"
         End-Frame
     }
 
     try {
         while ($true) {
+            try {
+                if ([Console]::WindowWidth -ne $script:WinW -or [Console]::WindowHeight -ne $script:WinH) {
+                    Write-SlideChrome 9 5 "Alta Disponibilidad HTTP · Caída de ms-cuentas-2"
+                }
+            } catch { }
             if ($stopProc -and -not $stopDone -and $stopProc.HasExited) {
                 $stopDone = $true
-                $eventMsg = "[EVENTO] ms-cuentas-2 detenida · Trafico absorbido 100% por ms-cuentas-1"
-                Update-DockInPlace
+                $detTxt = if ($null -ne $detectMs) { (" ({0:F2}s)" -f ($detectMs / 1000.0)) } else { "" }
+                $eventMsg = "[EVENTO] ms-cuentas-2 detenida · Convergencia a ms-cuentas-1$detTxt"
+                Update-DockInPlace (Get-ContainerMapSync)
             }
             if ($startProc -and -not $startDone -and $startProc.HasExited) {
                 $startDone = $true
                 $eventMsg = "[EVENTO] ms-cuentas-2 reiniciada (arranque JVM ~25s en segundo plano)"
-                Update-DockInPlace
+                Update-DockInPlace (Get-ContainerMapSync)
             }
-            if (([DateTime]::UtcNow - $lastDockPoll).TotalMilliseconds -ge 2000) {
-                $lastDockPoll = [DateTime]::UtcNow
-                Update-DockInPlace
-            }
+            Poll-AsyncDock
 
             $r = Invoke-ApiRequest "GET" "$Gateway/api/cuentas/$Origen" "" 3
             $totalReq++
+            $nowUtc = [DateTime]::UtcNow
             $ts = (Get-Date).ToString("HH:mm:ss")
             $inst = if ($r.Headers["x-service-instance"]) { $r.Headers["x-service-instance"] } else { "sin-instancia" }
             if ($r.Code -ne "200") {
                 $errReq++; $col = "Red"
+                $k = "HTTP $($r.Code)"
+                $errByCode[$k] = if ($errByCode.ContainsKey($k)) { $errByCode[$k] + 1 } else { 1 }
+                $consecC1 = 0; $streakStart = $null
             } elseif ($inst -like "ms-cuentas-2*") {
                 $c2++; $col = "Cyan"
+                $consecC1 = 0; $streakStart = $null
+                if ($phase -eq 3 -and $null -eq $rejoinMs -and $startTrigAt) {
+                    $rejoinMs = ($nowUtc - $startTrigAt).TotalMilliseconds
+                    $eventMsg = ("[EVENTO] ms-cuentas-2 reincorporada al balanceo en {0}s!" -f [string]::Format($script:Inv, "{0:F2}", ($rejoinMs / 1000.0)))
+                }
             } else {
                 $c1++; $col = "Green"
+                if ($phase -ge 2 -and $null -eq $detectMs -and $stopTrigAt) {
+                    if ($consecC1 -eq 0) { $streakStart = $nowUtc }
+                    $consecC1++
+                    if ($consecC1 -ge 3) {
+                        $detectMs = ($streakStart - $stopTrigAt).TotalMilliseconds
+                    }
+                }
             }
             $ring.Add(@{ Line = ("[{0}]  HTTP {1}  ->  {2}" -f $ts, $r.Code, $inst); Col = $col })
             if ($ring.Count -gt 6) { $ring.RemoveAt(0) }
@@ -786,7 +1169,7 @@ function Slide-09([bool]$UseCache = $false) {
             & $renderBody
 
             $sw = [System.Diagnostics.Stopwatch]::StartNew()
-            while ($sw.ElapsedMilliseconds -lt 280) {
+            while ($sw.ElapsedMilliseconds -lt 260) {
                 if (-not [Console]::IsInputRedirected -and [Console]::KeyAvailable) {
                     $act = Parse-ConsoleKey ([Console]::ReadKey($true))
                     if ($act -eq "QUIT" -or $act -eq "HOME" -or $act -eq "PREV" -or $act -match '^B[1-6]$') {
@@ -795,18 +1178,20 @@ function Slide-09([bool]$UseCache = $false) {
                     if ($act -eq "EUREKA") { Open-EurekaBrowser; continue }
                     if ($phase -eq 1) {
                         $phase = 2
-                        $eventMsg = "[ACCION] Deteniendo ms-cuentas-2 (docker compose stop)..."
+                        $stopTrigAt = [DateTime]::UtcNow; $consecC1 = 0; $streakStart = $null
+                        $eventMsg = "[ACCION] Deteniendo ms-cuentas-2 (docker compose stop)"
                         $stopProc = Start-BackgroundDocker "stop ms-cuentas-2"
                     } elseif ($phase -eq 2) {
                         $phase = 3
-                        $eventMsg = "[ACCION] Reiniciando ms-cuentas-2 (docker compose start)..."
+                        $startTrigAt = [DateTime]::UtcNow
+                        $eventMsg = "[ACCION] Reiniciando ms-cuentas-2 (docker compose start)"
                         $startProc = Start-BackgroundDocker "start ms-cuentas-2"
                     } else {
                         $abortAct = "DONE"; break
                     }
                     & $renderBody
                 }
-                Start-Sleep -Milliseconds 40
+                Start-Sleep -Milliseconds 30
             }
             if ($abortAct) { break }
         }
@@ -817,125 +1202,181 @@ function Slide-09([bool]$UseCache = $false) {
 
     if ($abortAct -and $abortAct -ne "DONE") { return $abortAct }
 
-    $script:LastBurstSummary = ("Total peticiones: {0}  |  Exitosas (200): {1}  |  Errores (!=200): {2}" -f $totalReq, ($totalReq - $errReq), $errReq)
-    Write-SlideChrome 9 5 "Alta Disponibilidad HTTP · Resumen de Contingencia"
-    Write-Host ""
-    $rCol = if ($errReq -eq 0) { "Green" } else { "Red" }
-    Write-BoxTop "RESUMEN DE ALTA DISPONIBILIDAD" $rCol
-    Write-BoxLine $script:LastBurstSummary $rCol $rCol
-    Write-BoxLine ("Distribucion: ms-cuentas-1={0}  |  ms-cuentas-2={1}" -f $c1, $c2) "White" $rCol
-    Write-BoxLine "Eureka dio de baja la instancia y API Gateway reintento GET sin errores." "Cyan" $rCol
+    $errSummary = if ($errByCode.Count -gt 0) {
+        (@($errByCode.Keys | Sort-Object | ForEach-Object { "$_ x$($errByCode[$_])" })) -join ", "
+    } else { "ninguno (reintento GET en Gateway)" }
+    $detStr = if ($null -ne $detectMs) { [string]::Format($script:Inv, "{0:F2}s", ($detectMs / 1000.0)) } else { "inmediata" }
+    $rejStr = if ($null -ne $rejoinMs) { [string]::Format($script:Inv, "{0:F2}s", ($rejoinMs / 1000.0)) } else { "~25s JVM" }
+
+    $script:LastBurstLines = @(
+        ("Total: {0}  |  Exitosas (200): {1}  |  Errores: {2}" -f $totalReq, ($totalReq - $errReq), $errReq),
+        ("Errores transitorios : {0}" -f $errSummary),
+        ("Distribucion : ms-cuentas-1={0}  |  ms-cuentas-2={1}" -f $c1, $c2),
+        ("Deteccion    : {0}  |  Retorno: {1}" -f $detStr, $rejStr),
+        ("Limitacion   : Gateway reintenta GET (no POST /transferir)")
+    )
+
+    Write-SlideChrome 9 5 "Alta Disponibilidad HTTP · Errores y Tiempos Observados"
+    Write-BlankLine
+    $rCol = if ($errReq -eq 0) { "Green" } else { "Yellow" }
+    Write-BoxTop "RESUMEN DE FALLO Y CONVERGENCIA" $rCol
+    Write-BoxLine $script:LastBurstLines[0] $rCol $rCol
+    Write-BoxLine $script:LastBurstLines[1] $(if ($errReq -eq 0) { "Green" } else { "Red" }) $rCol
+    Write-BoxLine $script:LastBurstLines[2] "White" $rCol
+    Write-BoxLine $script:LastBurstLines[3] "Cyan" $rCol
+    Write-BoxLine $script:LastBurstLines[4] "DarkGray" $rCol
     Write-BoxBottom $rCol
     return (Wait-SlideFooter "5b. Caída de réplica PostgreSQL")
 }
 
 function Slide-10([bool]$UseCache = $false) {
     Write-SlideChrome 10 5 "Alta Disponibilidad de Datos · Caída de Réplica PG"
-    Write-Host ""
+    Write-BlankLine
     Write-BoxTop "ESCENARIO: FALLO DE NODO DE LECTURA EN CALIENTE" "Yellow"
     Write-BoxLine "" "White" "Yellow"
     Write-BoxLine "  ● Se detiene replica1 mientras el servicio recibe consultas." "White" "Yellow"
-    Write-BoxLine "  ● El enrutador @UsarNodo captura el fallo y redirige la lectura" "White" "Yellow"
-    Write-BoxLine "    a la replica sana (X-Db-Fallback: true)." "White" "Yellow"
-    Write-BoxLine "" "White" "Yellow"
-    Write-BoxLine "  PRUEBA: docker compose stop replica1  +  20 lecturas consecutivas" "Cyan" "Yellow"
+    if ($script:InnerW -ge 68) {
+        Write-BoxLine "  ● @UsarNodo captura la excepcion y reintenta sobre la replica" "White" "Yellow"
+        Write-BoxLine "    sana (X-Db-Fallback: true) hasta que la sonda actua." "White" "Yellow"
+        Write-BoxLine "" "White" "Yellow"
+        Write-BoxLine "  PRUEBA: docker compose stop replica1  +  20 lecturas" "Cyan" "Yellow"
+    } else {
+        Write-BoxLine "  ● @UsarNodo reintenta sobre replica sana (X-Db-Fallback)" "White" "Yellow"
+        Write-BoxLine "    hasta que la sonda cada 3s marca replica1 caida." "White" "Yellow"
+        Write-BoxLine "" "White" "Yellow"
+        Write-BoxLine "  PRUEBA: stop replica1 + 20 lecturas consecutivas" "Cyan" "Yellow"
+    }
     Write-BoxLine "" "White" "Yellow"
     Write-BoxBottom "Yellow"
-    return (Wait-SlideFooter "Ejecutar caída de replica1 y lecturas")
+    return (Wait-SlideFooter "Caída replica1 + lecturas")
 }
 
 function Slide-11([bool]$UseCache = $false) {
-    & docker compose stop replica1 2>&1 | Out-Null
+    if (-not $UseCache -or -not $script:CacheLecturas11) {
+        & docker compose stop replica1 2>&1 | Out-Null
+        $script:StopRepAt = [DateTime]::UtcNow
+        [void](Get-ContainerMapSync)
+        $script:CacheLecturas11 = Invoke-LecturasFetch
+    }
     Write-SlideChrome 11 5 "Failover Transparente · Lecturas sobre REPLICA_2"
-    Write-Host ""
-    Write-Host "  $ docker compose stop replica1  [OK]" -ForegroundColor DarkCyan
-    Write-Host ""
-    $stats = Invoke-LecturasRender "Yellow"
-    Write-Host ("  [ {0}/20 RESPUESTAS 200 OK · TODAS EN REPLICA_2 · FALLBACK={1} RESCATADAS ]" -f $stats.Ok, $stats.Fallback) -ForegroundColor Green
+    Write-BlankLine
+    Write-CleanLine "  $ docker compose stop replica1  [OK]" "DarkCyan"
+    Write-BlankLine
+    $stats = Render-LecturasFromCache $script:CacheLecturas11 "Yellow"
+    $col = if ($stats.Err -eq 0) { "Green" } else { "Yellow" }
+    Write-CleanLine ("  [ {0}/20 OK · ERRORES: {1} · FALLBACK={2} · TIEMPO={3}s ]" -f $stats.Ok, $stats.ErrDetail, $stats.Fallback, $stats.Sec) $col
     return (Wait-SlideFooter "Estado de salud de réplicas")
 }
 
-function Render-DbEstadoBox([string]$Title) {
-    $r = Invoke-ApiRequest "GET" "$Gateway/api/cuentas/db/estado" "" 5
+function Render-DbEstadoBox([string]$Title, $Resp) {
     Write-BoxTop $Title "Cyan"
-    if ($r.Code -eq "200" -and $r.Body) {
-        if ($r.Body.servicio) {
-            Write-BoxLine ("Consultado en instancia: {0}" -f $r.Body.servicio) "DarkGray" "Cyan"
+    if ($Resp.Code -eq "200" -and $Resp.Body) {
+        if ($Resp.Body.servicio -or $Resp.Body.consultasTotales) {
+            $ct = $Resp.Body.consultasTotales
+            $ctTxt = if ($ct) { " · Consultas: PRI=$($ct.PRIMARY) R1=$($ct.REPLICA_1) R2=$($ct.REPLICA_2)" } else { "" }
+            Write-BoxLine ("Instancia: {0}{1}" -f $Resp.Body.servicio, $ctTxt) "DarkGray" "Cyan"
         }
-        foreach ($rep in $r.Body.replicas) {
+        foreach ($rep in $Resp.Body.replicas) {
             $avail = [bool]$rep.available
             $badge = if ($avail) { "[● ACTIVA · available=true ]" } else { "[✗ CAIDA  · available=false]" }
             $c = if ($avail) { "Green" } else { "Red" }
-            Write-BoxLine ("{0,-10} {1}  exitos={2,-3} LSN={3}" -f $rep.nodo, $badge, $rep.consecutiveSuccesses, $rep.lastReplayLsn) $c "Cyan"
+            $row = if ($script:InnerW -ge 66) {
+                "{0,-10} {1}  exitos={2,-3} LSN={3}" -f $rep.nodo, $badge, $rep.consecutiveSuccesses, $rep.lastReplayLsn
+            } else {
+                $shortB = if ($avail) { "[● ACTIVA]" } else { "[✗ CAIDA ]" }
+                "{0,-10} {1} ok={2,-4} LSN={3}" -f $rep.nodo, $shortB, $rep.consecutiveSuccesses, $rep.lastReplayLsn
+            }
+            Write-BoxLine $row $c "Cyan"
         }
     } else {
-        Write-BoxLine ("HTTP {0}: {1}" -f $r.Code, $r.Raw) "Red" "Cyan"
+        Write-BoxLine ("HTTP {0}: {1}" -f $Resp.Code, $Resp.Raw) "Red" "Cyan"
     }
     Write-BoxBottom "Cyan"
 }
 
 function Slide-12([bool]$UseCache = $false) {
     Write-SlideChrome 12 5 "Detección Automática de Réplica Caída (Sondeo 3s)"
-    Write-Host ""
-    Render-DbEstadoBox "SALUD DE REPLICAS (/api/cuentas/db/estado)"
-    Write-Host ""
-    Write-BoxTop "MECANISMO DE DETECCION" "DarkGray"
-    Write-BoxLine "● ReplicaHealthTracker sondea cada 3 segundos con pg_is_in_recovery()." "White" "DarkGray"
-    Write-BoxLine "● REPLICA_1 queda fuera del Round-Robin sin errores para el cliente." "White" "DarkGray"
+    Write-BlankLine
+    if (-not $UseCache -or -not $script:CacheEstado12) {
+        $script:CacheEstado12 = Invoke-ApiRequest "GET" "$Gateway/api/cuentas/db/estado" "" 5
+    }
+    Render-DbEstadoBox "SALUD DE REPLICAS (/api/cuentas/db/estado)" $script:CacheEstado12
+    Write-BlankLine
+    $elapsedStop = if ($script:StopRepAt) { [string]::Format($script:Inv, "{0:F1}s tras stop", ([DateTime]::UtcNow - $script:StopRepAt).TotalSeconds) } else { "sondeo cada 3.0s" }
+    Write-BoxTop "DETECCION Y LIMITACIONES" "DarkGray"
+    Write-BoxLine ("● Deteccion: {0} (ReplicaHealthTracker, c/3s)." -f $elapsedStop) "White" "DarkGray"
+    Write-BoxLine "● Limitacion: failover solo lectura (no promueve PRIMARY)." "Yellow" "DarkGray"
     Write-BoxBottom "DarkGray"
     return (Wait-SlideFooter "Reiniciar replica1 (recuperación WAL)")
 }
 
 function Slide-13([bool]$UseCache = $false) {
-    & docker compose start replica1 2>&1 | Out-Null
+    if (-not $UseCache) {
+        & docker compose start replica1 2>&1 | Out-Null
+        $script:StartRepAt = [DateTime]::UtcNow
+        [void](Get-ContainerMapSync)
+    }
     Write-SlideChrome 13 5 "Recuperación de Réplica · Streaming WAL y Umbral 2/2"
-    Write-Host ""
-    Write-Host "  $ docker compose start replica1  [OK]" -ForegroundColor DarkCyan
-    Write-Host ""
+    Write-BlankLine
+    Write-CleanLine "  $ docker compose start replica1  [OK]" "DarkCyan"
+    Write-BlankLine
     Write-BoxTop "SINCRONIZACION AUTOMATICA EN CURSO" "Green"
     Write-BoxLine "[✓] Contenedor replica1 reiniciado." "Green" "Green"
-    Write-BoxLine "[~] Sincronizando registros WAL pendientes desde el nodo primario..." "Yellow" "Green"
-    Write-BoxLine "[~] Umbral de reincorporacion: 2 chequeos consecutivos sanos (2 x 3s)." "Cyan" "Green"
+    Write-BoxLine "[~] Sincronizando registros WAL desde el nodo primario." "Yellow" "Green"
+    Write-BoxLine "[~] Umbral de retorno: 2 chequeos sanos seguidos (2 x 3s)." "Cyan" "Green"
     Write-BoxBottom "Green"
-    return (Wait-SlideFooter "Verificar reincorporación al Round-Robin")
+    return (Wait-SlideFooter "Verificar retorno al Round-Robin")
 }
 
 function Slide-14([bool]$UseCache = $false) {
     Write-SlideChrome 14 5 "Reincorporación Automática de replica1 al Round-Robin"
-    Write-Host ""
-    Render-DbEstadoBox "SALUD DE REPLICAS TRAS RECUPERACION (/api/cuentas/db/estado)"
-    Write-Host ""
-    Write-BoxTop "RETORNO AUTOMATICO" "DarkGray"
-    Write-BoxLine "● Una vez completados 2 chequeos exitosos, REPLICA_1 regresa al balanceo." "White" "DarkGray"
+    Write-BlankLine
+    if (-not $UseCache -or -not $script:CacheEstado14) {
+        $script:CacheEstado14 = Invoke-ApiRequest "GET" "$Gateway/api/cuentas/db/estado" "" 5
+    }
+    Render-DbEstadoBox "SALUD DE REPLICAS TRAS RECUPERACION (/api/cuentas/db/estado)" $script:CacheEstado14
+    Write-BlankLine
+    $elapsedStart = if ($script:StartRepAt) { [string]::Format($script:Inv, "{0:F1}s tras start", ([DateTime]::UtcNow - $script:StartRepAt).TotalSeconds) } else { "~6-8s habituales" }
+    Write-BoxTop "RETORNO AUTOMATICO Y LIMITACION" "DarkGray"
+    Write-BoxLine ("● Retorno: {0} (2x pg_is_in_recovery=true)." -f $elapsedStart) "White" "DarkGray"
+    Write-BoxLine "● Limitacion: depende de wal_keep_size (usar slots en prod)." "Yellow" "DarkGray"
     Write-BoxBottom "DarkGray"
     return (Wait-SlideFooter "6. Conclusiones técnicas")
 }
 
 function Slide-15([bool]$UseCache = $false) {
     Write-SlideChrome 15 6 "Conclusiones Técnicas · Decisiones, Limitaciones y Mejoras"
-    Write-Host ""
-    Write-Host " ┌─ DECISIONES ──────────┐ ┌─ LIMITACIONES ────────┐ ┌─ MEJORAS FUTURAS ─────┐" -ForegroundColor Cyan
-    $rows = @(
-        @("· BD por @UsarNodo",      "· Sin failover primario", "· Failover (Patroni)"),
-        @("  write->PRI / read->REP","· Eureka unico (SPOF)",   "· Claves idempotencia"),
-        @("· Round Robin + salud",   "· /movimiento-interno",   "· Retry conexion en"),
-        @("  chequeo 2 de 2",        "  expuesto en Gateway",   "  ms-transacciones"),
-        @("· Eureka sin cache +",    "· Limite diario no se",   "· Health Eureka real"),
-        @("  retry GET (0 err P03)", "  reinicia solo",         "· Bloquear ruta interna"),
-        @("· Flyway advisory lock",  "· Sin idempotencia P2P",  "  y Sagas / Outbox")
-    )
-    foreach ($r in $rows) {
-        Write-Host " │" -ForegroundColor Green -NoNewline
-        Write-Host (Format-Fixed $r[0] 23) -ForegroundColor White -NoNewline
-        Write-Host "│ │" -ForegroundColor Yellow -NoNewline
-        Write-Host (Format-Fixed $r[1] 23) -ForegroundColor White -NoNewline
-        Write-Host "│ │" -ForegroundColor Cyan -NoNewline
-        Write-Host (Format-Fixed $r[2] 23) -ForegroundColor White -NoNewline
-        Write-Host "│" -ForegroundColor Cyan
+    Write-BlankLine
+    if ($script:InnerW -ge 72) {
+        $rows = @(
+            @("· BD por @UsarNodo",      "· Sin failover primario", "· Failover (Patroni)"),
+            @("  write->PRI  read->REP", "· Eureka unico (SPOF)",   "· Claves idempotencia"),
+            @("· Round Robin + salud",   "· /movimiento-interno",   "· Retry conexion en"),
+            @("  chequeo 2 de 2",        "  expuesto en Gateway",   "  ms-transacciones"),
+            @("· Eureka sin cache +",    "· Limite diario no se",   "· Health Eureka real"),
+            @("  retry GET (0 err P03)", "  reinicia solo",         "· Bloquear ruta interna"),
+            @("· Flyway advisory lock",  "· Sin idempotencia P2P",  "  y Sagas / Outbox")
+        )
+        Write-ThreeColCards @("DECISIONES", "LIMITACIONES", "MEJORAS FUTURAS") @("Green", "Yellow", "Cyan") $rows
+    } else {
+        $rows = @(
+            @("· @UsarNodo JDBC",   "· Sin failover PRI", "· Failover Patroni"),
+            @("  W:PRI R:REPLICA",  "· Eureka unico",     "· Idempotencia P2P"),
+            @("· Round-Robin 2/2",  "· /mov-interno en",  "· Retry conexion"),
+            @("  salud verificada", "  ruta del Gateway", "  ms-transacciones"),
+            @("· Eureka sin cache", "· Limite diario",    "· Health Eureka"),
+            @("  + retry GET GW",   "  sin auto-reset",   "· Cerrar /mov-int"),
+            @("· Flyway adv. lock", "· Sin idempotencia", "  + Sagas / Outbox")
+        )
+        Write-ThreeColCards @("DECISIONES", "LIMITACIONES", "MEJORAS") @("Green", "Yellow", "Cyan") $rows
     }
-    Write-Host " └───────────────────────┘ └───────────────────────┘ └───────────────────────┘" -ForegroundColor DarkGray
     Write-BoxTop "SINTESIS FINAL" "Cyan"
-    Write-BoxLine '  "Mas de uno de todo, y saber esquivar al que falla. Sistema distribuido."' "Cyan" "Cyan"
+    $quote = if ($script:InnerW -ge 74) {
+        '"Mas de uno de todo, y saber esquivar al que falla. Sistema distribuido."'
+    } else {
+        '"Replicar cada capa y esquivar al nodo que falla."'
+    }
+    Write-BoxLine (Format-Center $quote $script:InnerW) "Cyan" "Cyan"
     Write-BoxBottom "Cyan"
     return (Wait-SlideFooter "Volver a Portada")
 }
@@ -955,6 +1396,7 @@ function Run-Deck([int]$StartSlide) {
         $act = & $slides[$idx] $useCache
         $useCache = $false
         switch ($act) {
+            "RESIZE" { $useCache = $true; continue }
             "PREV" {
                 if ($idx -eq 0) { return "PORTADA" }
                 $idx--
@@ -965,6 +1407,7 @@ function Run-Deck([int]$StartSlide) {
             "QUIT"   { return "QUIT" }
             "UTILS" {
                 $u = Show-UtilsPanel
+                $script:FirstFrame = $true
                 if ($u -eq "QUIT") { return "QUIT" }
                 if ($u -match '^B([1-6])$') { $idx = $map[$Matches[1]] }
             }
@@ -982,49 +1425,99 @@ function Run-Deck([int]$StartSlide) {
 
 function Show-Portada {
     $blockMap = @{ "B1" = 0; "B2" = 2; "B3" = 4; "B4" = 6; "B5" = 8; "B6" = 14 }
+    $salCached = $null
+    $lastSalPoll = [DateTime]::MinValue
     while ($true) {
         Begin-Frame
-        Write-Host ("╔" + ("═" * 76) + "╗") -ForegroundColor DarkCyan
-        Write-Host ("║ " + (Format-Fixed "BILLETERA DIGITAL DISTRIBUIDA  ·  ARQUITECTURA DE MICROSERVICIOS" 74) + " ║") -ForegroundColor Cyan
-        Write-Host ("║ " + (Format-Fixed "Spring Boot 3.4 · Netflix Eureka · API Gateway · PostgreSQL 17 (WAL)" 74) + " ║") -ForegroundColor DarkGray
-        Write-Host ("╚" + ("═" * 76) + "╝") -ForegroundColor DarkCyan
+        $pTitle = if ($script:InnerW -ge 66) { "BILLETERA DIGITAL DISTRIBUIDA · DEMO EN VIVO" } else { "BILLETERA DIGITAL · DEMO EN VIVO" }
+        $pSub   = if ($script:InnerW -ge 70) { "Replicacion PostgreSQL WAL, descubrimiento Eureka y failover" } else { "Replicacion Postgres WAL, Eureka y tolerancia a fallos" }
+        Write-CleanLine ("╔" + ("═" * ($script:UiW - 2)) + "╗") "DarkCyan"
+        Write-Host ($script:Margin + "║ ") -ForegroundColor DarkCyan -NoNewline
+        Write-Host (Format-Center $pTitle $script:InnerW) -ForegroundColor Cyan -NoNewline
+        Write-Host " ║" -ForegroundColor DarkCyan -NoNewline
+        Complete-Row
+        Write-Host ($script:Margin + "║ ") -ForegroundColor DarkCyan -NoNewline
+        Write-Host (Format-Center $pSub $script:InnerW) -ForegroundColor DarkGray -NoNewline
+        Write-Host " ║" -ForegroundColor DarkCyan -NoNewline
+        Complete-Row
+        Write-CleanLine ("╚" + ("═" * ($script:UiW - 2)) + "╝") "DarkCyan"
 
         Render-ClusterDock $true
+        if (-not [Console]::IsOutputRedirected -and $script:LastScreenId -ne "PORTADA") {
+            try { Clear-TailFrom ([Console]::CursorTop) } catch { }
+        }
+        $script:LastScreenId = "PORTADA"
 
-        Write-Host ""
-        Write-Host "  ┌─ INFRAESTRUCTURA ────┐ ┌─ OPERACION & DATOS ──┐ ┌─ ALTA DISPONIBILIDAD ┐" -ForegroundColor White
-        Write-Host "  │ 1. Arquitectura      │ │ 4. Balanceo HTTP     │ │ 7. Tolerancia HTTP   │" -ForegroundColor Green
-        Write-Host "  │ 2. Eureka & Gateway  │ │ 5. Transferencias    │ │ 8. Failover Replica  │" -ForegroundColor Cyan
-        Write-Host "  │ 3. Cluster PG17 WAL  │ │ 6. CQRS-lite & RYOW  │ │ 9. Retorno Automatico│" -ForegroundColor Yellow
-        Write-Host "  └──────────────────────┘ └──────────────────────┘ └──────────────────────┘" -ForegroundColor White
+        $leg = if ($script:InnerW -ge 72) {
+            "  ● En linea   ~ Iniciando   ✗ Caido     (actualizado en segundo plano)"
+        } else {
+            "  ● En linea   ~ Iniciando   ✗ Caido"
+        }
+        Write-CleanLine $leg "DarkGray"
 
-        $sal = Get-SaldoInfo
-        Write-Host ""
-        if (-not (Test-Path (Join-Path $RepoDir ".env"))) {
-            Write-Host "  [AVISO] Falta .env -> [U] -> [P] Reinicio limpio" -ForegroundColor Yellow
-        } elseif ($sal) {
-            $cons = [decimal]$sal.consumidoHoy
+        Write-BlankLine
+        $agTitle = if ($script:InnerW -ge 70) { "RECORRIDO (15 DIAPOSITIVAS) · ELIGE SECCION [1-6]" } else { "RECORRIDO (15 SLIDES) · PULSA [1-6]" }
+        Write-BoxTop $agTitle "DarkCyan"
+        $colL = [int][Math]::Floor(($script:InnerW - 3) / 2)
+        $colR = $script:InnerW - 3 - $colL
+        $agRows = if ($script:InnerW -ge 74) {
+            @(
+                @("[1] Arquitectura y Docker  (01-02)", "[4] Lecturas Replica y RYOW (07-08)"),
+                @("[2] Eureka y Balanceo HTTP (03-04)", "[5] Caidas: App y Postgres  (09-14)"),
+                @("[3] Transferencia P2P ACID (05-06)", "[6] Conclusiones Tecnicas      (15)")
+            )
+        } else {
+            @(
+                @("[1] Arquitectura    (01-02)", "[4] Lecturas y RYOW (07-08)"),
+                @("[2] Eureka/Balanceo (03-04)", "[5] Fallos App/BD   (09-14)"),
+                @("[3] P2P Transf ACID (05-06)", "[6] Conclusiones       (15)")
+            )
+        }
+        foreach ($ar in $agRows) {
+            Write-Host ($script:Margin + "│ ") -ForegroundColor DarkCyan -NoNewline
+            Write-Host (Format-Fixed $ar[0] $colL) -ForegroundColor White -NoNewline
+            Write-Host " │ " -ForegroundColor DarkGray -NoNewline
+            Write-Host (Format-Fixed $ar[1] $colR) -ForegroundColor White -NoNewline
+            Write-Host " │" -ForegroundColor DarkCyan -NoNewline
+            Complete-Row
+        }
+        Write-BoxBottom "DarkCyan"
+
+        if (([DateTime]::UtcNow - $lastSalPoll).TotalSeconds -ge 4) {
+            $salCached = Get-SaldoInfo
+            $lastSalPoll = [DateTime]::UtcNow
+        }
+        Write-BlankLine
+        if ($salCached) {
+            $cons = [decimal]$salCached.consumidoHoy
             $sc = if ($cons -eq 0) { "Green" } else { "Yellow" }
             $badge = if ($cons -gt 0) { " [REINICIAR CON U->P]" } else { " [LISTO]" }
-            Write-Host ('  Cuenta {0} : saldo=${1} | usado=${2}/${3}{4}' -f $Origen, (Format-Money $sal.saldo), (Format-Money $sal.consumidoHoy), (Format-Money $sal.limiteDiario), $badge) -ForegroundColor $sc
+            Write-CleanLine ('  Cuenta demo {0} : saldo=${1} | hoy=${2}/${3}{4}' -f $Origen, (Format-Money $salCached.saldo), (Format-Money $salCached.consumidoHoy), (Format-Money $salCached.limiteDiario), $badge) $sc
+        } elseif (-not (Test-Path (Join-Path $RepoDir ".env"))) {
+            Write-CleanLine "  [AVISO] Gateway sin respuesta y falta .env -> [U] -> [C] / [P]" "Yellow"
         } else {
-            Write-Host "  Gateway :8080 : Esperando conexion..." -ForegroundColor DarkGray
+            Write-CleanLine "  Gateway :8080 sin conexion -> Pulsa [U] para iniciar servicios" "DarkGray"
         }
 
-        Write-Host ("─" * 78) -ForegroundColor DarkGray
-        Write-Host "  ► [ESPACIO / ENTER / →] Iniciar Presentacion (Diapositiva 1/15)" -ForegroundColor Green
-        Write-Host "    [1-6] Ir a Seccion   [B] Eureka   [U] Utilidades   [Q] Salir" -ForegroundColor DarkGray
+        Write-Divider
+        $startPrompt = if ($script:UiW -ge 68) { "  ► [ESPACIO / ENTER] Iniciar Presentacion (Diapositiva 1/15)" } else { "  ► [ESPACIO/→] Iniciar Presentacion (1/15)" }
+        $navPrompt   = if ($script:UiW -ge 74) { "    Atajos: [1-6] Ir a seccion   [B] Eureka   [U] Utilidades   [Q] Salir" } else { "    [1-6] Seccion  [B] Eureka  [U] Utils  [Q] Salir" }
+        Write-CleanLine $startPrompt "Green"
+        Write-CleanLine $navPrompt "DarkGray"
         End-Frame
 
         $act = Read-SlideKeyLive $true
         $res = "PORTADA"
         switch ($act) {
+            "RESIZE"       { continue }
             "QUIT"         { return }
             "EUREKA"       { Open-EurekaBrowser }
-            "DOCK_REFRESH" { Update-DockInPlace }
-            "PREP"         { Show-CleanPrep }
+            "DOCK_REFRESH" { Update-DockInPlace (Get-ContainerMapSync) }
+            "PREP"         { Show-CleanPrep; $lastSalPoll = [DateTime]::MinValue }
             "UTILS" {
                 $u = Show-UtilsPanel
+                $script:FirstFrame = $true
+                $lastSalPoll = [DateTime]::MinValue
                 if ($u -eq "QUIT") { return }
                 if ($u -match '^B[1-6]$') { $res = Run-Deck $blockMap[$u] }
             }
@@ -1034,6 +1527,7 @@ function Show-Portada {
                 } elseif ($act -eq "NEXT" -or $act -eq "REPEAT") {
                     $res = Run-Deck 0
                 }
+                $lastSalPoll = [DateTime]::MinValue
             }
         }
         if ($res -eq "QUIT") { return }
