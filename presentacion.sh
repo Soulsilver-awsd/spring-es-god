@@ -910,13 +910,19 @@ show_log_modal() {
 
 record_http_trace() {
   local method="$1" url="$2" req_json="$3" code="$4" ms="$5" hdr_f="$6" body_f="$7" note="${8:-}"
-  TRACE_SEQ=$((TRACE_SEQ + 1))
+  local seq_f="$TRACE_DIR/.seq"
+  local seq=0
+  [ -f "$seq_f" ] && seq="$(cat "$seq_f" 2>/dev/null || echo 0)"
+  seq=$((seq + 1))
+  printf '%s' "$seq" > "$seq_f"
+  TRACE_SEQ="$seq"
   local id
-  printf -v id '%04d' "$TRACE_SEQ"
+  printf -v id '%04d' "$seq"
   local ts scr
   ts="$(date +%H:%M:%S)"
   scr="${LAST_SCREEN_ID:-PORTADA}"
   printf '%s|%s|%s|%s|%s|%s|%s\n' "$ts" "$scr" "$method" "$url" "$code" "$ms" "${note//|//}" > "$TRACE_DIR/${id}.meta"
+  rm -f "$TRACE_DIR/${id}.req" "$TRACE_DIR/${id}.hdr" "$TRACE_DIR/${id}.body"
   [ -n "$req_json" ] && printf '%s' "$req_json" > "$TRACE_DIR/${id}.req"
   [ -f "$hdr_f" ] && cp "$hdr_f" "$TRACE_DIR/${id}.hdr"
   [ -f "$body_f" ] && cp "$body_f" "$TRACE_DIR/${id}.body"
@@ -1009,6 +1015,14 @@ export_presentation_report() {
       ok7="$(cut -d'|' -f1 "$TMP/lect_meta_07.txt")"
       sec7="$(cut -d'|' -f5 "$TMP/lect_meta_07.txt")"
       sum_rows="${sum_rows}| Slide 07 · Lecturas en Réplicas | $ok7/20 HTTP 200 (${sec7}s) |\n"
+    fi
+    if [ "${CACHE_LECT11_READY:-0}" -eq 1 ] && [ -f "$TMP/lect_meta_11.txt" ]; then
+      has_sum=1
+      local ok11 sec11 fb11
+      ok11="$(cut -d'|' -f1 "$TMP/lect_meta_11.txt")"
+      sec11="$(cut -d'|' -f5 "$TMP/lect_meta_11.txt")"
+      fb11="$(cut -d'|' -f4 "$TMP/lect_meta_11.txt")"
+      sum_rows="${sum_rows}| Slide 11 · Failover en Réplica 2 | $ok11/20 HTTP 200 (fallback=$fb11, ${sec11}s) |\n"
     fi
     if [ -n "$CACHE_CRIT_CODE" ]; then
       has_sum=1
@@ -1103,7 +1117,7 @@ export_presentation_report() {
   add_event_log "OK" "SYS" "Reporte exportado: reportes/$fname"
   EXPORT_LAST_PATH="$full_path"
   EXPORT_LAST_REL="reportes/$fname"
-  EXPORT_LAST_TRACES="$TRACE_SEQ"
+  EXPORT_LAST_TRACES="$(cat "$TRACE_DIR/.seq" 2>/dev/null || echo "$TRACE_SEQ")"
   EXPORT_LAST_EVENTS="$(wc -l < "$LOG_FILE" 2>/dev/null | tr -d ' ')"
 }
 
@@ -1140,7 +1154,7 @@ show_export_modal() {
 }
 
 api_req() {
-  local method="$1" url="$2" json="${3:-}" tout="${4:-10}" quiet="${5:-0}" code t0=0 t1=0
+  local method="$1" url="$2" json="${3:-}" tout="${4:-10}" quiet="${5:-0}" note="${6:-}" code t0=0 t1=0
   [ "$quiet" -eq 0 ] && t0="$(now_ms)"
   local args=(-s --max-time "$tout" -o "$BODY_FILE" -D "$HEADERS_FILE" -w '%{http_code}' -X "$method" "$url")
   if [ -n "$json" ]; then
@@ -1157,7 +1171,7 @@ api_req() {
     [[ "$code" == 2* ]] && lvl="OK"
     [ "$code" = "409" ] && lvl="WARN"
     add_event_log "$lvl" "HTTP" "$method $short_p -> $code (${ms}ms)"
-    record_http_trace "$method" "$url" "$json" "$code" "$ms" "$HEADERS_FILE" "$BODY_FILE"
+    record_http_trace "$method" "$url" "$json" "$code" "$ms" "$HEADERS_FILE" "$BODY_FILE" "$note"
   fi
   echo "$code"
 }
@@ -1547,7 +1561,7 @@ slide_03() {
   ui_blank
   if [ "$use_cache" -eq 0 ] || [ -z "$CACHE_EUREKA_CODE" ]; then
     show_pending_msg "Consultando registro en Eureka (:8761/eureka/apps)…"
-    CACHE_EUREKA_CODE="$(api_req GET "$EUREKA/eureka/apps" "" 5)"
+    CACHE_EUREKA_CODE="$(api_req GET "$EUREKA/eureka/apps" "" 5 0 "Catalogo de servicios registrados en Eureka")"
     cp "$BODY_FILE" "$TMP/eureka_cache.json" 2>/dev/null || true
     restore_pending_msg
   fi
@@ -1618,7 +1632,7 @@ slide_04() {
     local i code inst ok_cnt=0
     for i in $(seq 1 20); do
       code="$(api_req GET "$GATEWAY/api/cuentas/instancia" "" 5 1)"
-      [ "$i" -eq 1 ] && record_http_trace "GET" "$GATEWAY/api/cuentas/instancia" "" "$code" "0" "$HEADERS_FILE" "$BODY_FILE" "Muestra 1/20 del balanceo Round Robin"
+      [ "$i" -eq 1 ] && record_http_trace "GET" "$GATEWAY/api/cuentas/instancia" "" "$code" "0" "$HEADERS_FILE" "$BODY_FILE" "Muestra testigo de balanceo Round Robin (lote de 20 peticiones)"
       [ "$code" = "200" ] && ok_cnt=$((ok_cnt + 1))
       inst="$(get_header "X-Service-Instance")"; [ -z "$inst" ] && inst="sin-cabecera"
       printf '%s %s\n' "$code" "$inst" >> "$TMP/balanceo.txt"
@@ -1669,7 +1683,7 @@ slide_05() {
   if [ "$use_cache" -eq 0 ] || [ -z "$CACHE_TX_OK_FILE" ] || [ ! -f "$CACHE_TX_OK_FILE" ]; then
     show_pending_msg 'Ejecutando transferencia P2P de prueba ($25.00)…'
     local payload="{\"celularOrigen\":\"$ORIGEN\",\"celularDestino\":\"$DESTINO\",\"monto\":25,\"motivo\":\"Transferencia P2P\"}"
-    code="$(api_req POST "$GATEWAY/api/transacciones/transferir" "$payload" 10)"
+    code="$(api_req POST "$GATEWAY/api/transacciones/transferir" "$payload" 10 0 "Transferencia P2P exitosa (ACID)")"
     cp "$BODY_FILE" "$TMP/cache_tx_ok.json"
     printf '%s' "$code" > "$TMP/cache_tx_ok.code"
     CACHE_TX_OK_FILE="$TMP/cache_tx_ok.json"
@@ -1723,7 +1737,7 @@ slide_06() {
   if [ "$use_cache" -eq 0 ] || [ -z "$CACHE_TX_ERR_FILE" ] || [ ! -f "$CACHE_TX_ERR_FILE" ]; then
     show_pending_msg 'Validando rechazo controlado (monto $9999.00 > saldo)…'
     local payload="{\"celularOrigen\":\"$ORIGEN\",\"celularDestino\":\"$DESTINO\",\"monto\":9999,\"motivo\":\"Prueba limite\"}"
-    code="$(api_req POST "$GATEWAY/api/transacciones/transferir" "$payload" 10)"
+    code="$(api_req POST "$GATEWAY/api/transacciones/transferir" "$payload" 10 0 "Validacion de saldo insuficiente (HTTP 409)")"
     cp "$BODY_FILE" "$TMP/cache_tx_err.json"
     printf '%s' "$code" > "$TMP/cache_tx_err.code"
     CACHE_TX_ERR_FILE="$TMP/cache_tx_err.json"
@@ -1758,7 +1772,15 @@ fetch_lecturas_data() {
   for i in $(seq 1 10); do
     for u in "cuentas/$ORIGEN/contactos" "transacciones/historial/$ORIGEN"; do
       code="$(api_req GET "$GATEWAY/api/$u" "" 5 1)"
-      [ "$i" -eq 1 ] && record_http_trace "GET" "$GATEWAY/api/$u" "" "$code" "0" "$HEADERS_FILE" "$BODY_FILE" "Muestra 1/10 de lecturas ordinarias en replica"
+      if [ "$i" -eq 1 ]; then
+        local note_suffix="contactos"
+        [[ "$u" == *historial* ]] && note_suffix="historial"
+        local trace_note="Muestra testigo de lectura ordinaria en replica ($note_suffix, lote de 10 peticiones)"
+        if [ "$tag" = "11" ]; then
+          trace_note="Muestra testigo en replica superviviente tras caida de replica1 ($note_suffix, lote de 10 peticiones)"
+        fi
+        record_http_trace "GET" "$GATEWAY/api/$u" "" "$code" "0" "$HEADERS_FILE" "$BODY_FILE" "$trace_note"
+      fi
       if [ "$code" = "200" ]; then
         ok_cnt=$((ok_cnt + 1))
       else
@@ -1860,7 +1882,7 @@ slide_08() {
   ui_blank
   if [ "$use_cache" -eq 0 ] || [ -z "$CACHE_CRIT_CODE" ]; then
     show_pending_msg "Consultando /saldo-critico directo al PRIMARIO…"
-    CACHE_CRIT_CODE="$(api_req GET "$GATEWAY/api/cuentas/$ORIGEN/saldo-critico" "" 5)"
+    CACHE_CRIT_CODE="$(api_req GET "$GATEWAY/api/cuentas/$ORIGEN/saldo-critico" "" 5 0 "Lectura critica RYOW (consistencia inmediata en Primary)")"
     cp "$BODY_FILE" "$TMP/crit_cache.json" 2>/dev/null || true
     restore_pending_msg
   fi
@@ -2223,7 +2245,7 @@ slide_12() {
   ui_blank
   if [ "$use_cache" -eq 0 ] || [ -z "$CACHE_EST12_CODE" ]; then
     show_pending_msg "Consultando estado de salud (/api/cuentas/db/estado)…"
-    CACHE_EST12_CODE="$(api_req GET "$GATEWAY/api/cuentas/db/estado" "" 5)"
+    CACHE_EST12_CODE="$(api_req GET "$GATEWAY/api/cuentas/db/estado" "" 5 0 "Estado del cluster PostgreSQL tras caida de replica1")"
     cp "$BODY_FILE" "$TMP/est12_cache.json" 2>/dev/null || true
     restore_pending_msg
   fi
@@ -2267,7 +2289,7 @@ slide_14() {
   ui_blank
   if [ "$use_cache" -eq 0 ] || [ -z "$CACHE_EST14_CODE" ]; then
     show_pending_msg "Consultando reincorporacion (/api/cuentas/db/estado)…"
-    CACHE_EST14_CODE="$(api_req GET "$GATEWAY/api/cuentas/db/estado" "" 5)"
+    CACHE_EST14_CODE="$(api_req GET "$GATEWAY/api/cuentas/db/estado" "" 5 0 "Estado del cluster PostgreSQL tras reincorporacion de replica1")"
     cp "$BODY_FILE" "$TMP/est14_cache.json" 2>/dev/null || true
     restore_pending_msg
   fi
