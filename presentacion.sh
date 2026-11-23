@@ -374,7 +374,7 @@ update_dock_in_place() {
 }
 
 slide_chrome() {
-  local num="$1" active="$2" title="$3"
+  local num="$1" active="$2" title="$3" cached="${4:-0}" is_live="${5:-0}"
   begin_frame
   DOCK_ROW=$((PAD_T + 5))
   local labels tab_len bar_len=10
@@ -386,11 +386,10 @@ slide_chrome() {
     tab_len=47
   fi
   [ "$INNER_W" -ge 88 ] && bar_len=14
-  local right gap row2 i col
+  local right gap i col
   right="$(printf '%02d/15 %s' "$num" "$(get_progress_bar "$num" 15 "$bar_len")")"
   gap=$((INNER_W - tab_len - ${#right}))
   [ "$gap" -lt 1 ] && gap=1
-  row2="$(pad_fixed "► $title" "$INNER_W")"
 
   printf '%s%s╔%s╗%s%s\n' "$MARGIN" "$C_CYAN" "$(repeat_char '═' "$((UI_W - 2))")" "$C_RESET" "$CLR_EOL"
   printf '%s%s║ ' "$MARGIN" "$C_CYAN"
@@ -401,7 +400,23 @@ slide_chrome() {
     [ "$i" -lt 5 ] && printf ' '
   done
   printf '%*s%s%s%s ║%s%s\n' "$gap" "" "$C_CYAN" "$right" "$C_CYAN" "$C_RESET" "$CLR_EOL"
-  printf '%s%s║ %s%s%s ║%s%s\n' "$MARGIN" "$C_CYAN" "${C_BOLD}${C_WHITE}" "$row2" "$C_CYAN" "$C_RESET" "$CLR_EOL"
+
+  local left_title="► $title" badge="" badge_col="$C_DIM"
+  if [ "$cached" -eq 1 ]; then
+    [ "$INNER_W" -ge 70 ] && badge="[CACHE · R]" || badge="[CACHE]"
+    badge_col="${C_BOLD}${C_YELLOW}"
+  elif [ "$is_live" -eq 1 ]; then
+    [ "$INNER_W" -ge 70 ] && badge="[EN VIVO]" || badge="[VIVO]"
+    badge_col="${C_BOLD}${C_GREEN}"
+  fi
+
+  if [ -n "$badge" ] && [ $(( ${#left_title} + 1 + ${#badge} )) -le "$INNER_W" ]; then
+    local gap2=$((INNER_W - ${#left_title} - ${#badge}))
+    printf '%s%s║ %s%s%*s%s%s%s ║%s%s\n' \
+      "$MARGIN" "$C_CYAN" "${C_BOLD}${C_WHITE}" "$left_title" "$gap2" "" "$badge_col" "$badge" "$C_CYAN" "$C_RESET" "$CLR_EOL"
+  else
+    printf '%s%s║ %s%s%s ║%s%s\n' "$MARGIN" "$C_CYAN" "${C_BOLD}${C_WHITE}" "$(pad_fixed "$left_title" "$INNER_W")" "$C_CYAN" "$C_RESET" "$CLR_EOL"
+  fi
   printf '%s%s╚%s╝%s%s\n' "$MARGIN" "$C_CYAN" "$(repeat_char '═' "$((UI_W - 2))")" "$C_RESET" "$CLR_EOL"
 
   render_cluster_dock
@@ -409,6 +424,17 @@ slide_chrome() {
     printf '\033[J'
   fi
   LAST_SCREEN_ID="S${num}"
+}
+
+show_pending_msg() {
+  [ ! -t 1 ] && return
+  printf '\033[s'
+  ui_line "$C_YELLOW" "  [~] $1"
+  printf '\033[J'
+}
+
+restore_pending_msg() {
+  [ -t 1 ] && printf '\033[u' || true
 }
 
 open_eureka() {
@@ -432,6 +458,7 @@ parse_key_char() {
     case "$seq" in
       "[D"|"OD"|"[5~") ACT="PREV" ;;
       "[C"|"OC"|"[6~") ACT="NEXT" ;;
+      "OP"|"[[A")      ACT="HELP" ;;
       "")              ACT="HOME" ;;
       *)               ACT="NEXT" ;;
     esac
@@ -441,20 +468,21 @@ parse_key_char() {
     ACT="PREV"; return
   fi
   case "$k" in
-    a|A) ACT="PREV" ;;
-    n|N) ACT="NEXT" ;;
-    r|R) ACT="REPEAT" ;;
-    m|M) ACT="HOME" ;;
-    q|Q) ACT="QUIT" ;;
-    b|B) ACT="EUREKA" ;;
-    u|U) ACT="UTILS" ;;
-    p|P) ACT="PREP" ;;
-    s|S) ACT="STARTALL" ;;
-    t|T) ACT="SUITE" ;;
-    c|C) ACT="ENV" ;;
-    w|W) ACT="DOCK_REFRESH" ;;
+    a|A)   ACT="PREV" ;;
+    n|N)   ACT="NEXT" ;;
+    r|R)   ACT="REPEAT" ;;
+    m|M)   ACT="HOME" ;;
+    q|Q)   ACT="QUIT" ;;
+    b|B)   ACT="EUREKA" ;;
+    u|U)   ACT="UTILS" ;;
+    p|P)   ACT="PREP" ;;
+    s|S)   ACT="STARTALL" ;;
+    t|T)   ACT="SUITE" ;;
+    c|C)   ACT="ENV" ;;
+    w|W)   ACT="DOCK_REFRESH" ;;
+    h|H|\?) ACT="HELP" ;;
     [1-6]) ACT="B$k" ;;
-    *)   ACT="NEXT" ;;
+    *)     ACT="NEXT" ;;
   esac
 }
 
@@ -483,19 +511,28 @@ read_slide_key_live() {
 }
 
 wait_slide_footer() {
-  local next_lbl="${1:-Siguiente}" allow_back="${2:-1}"
+  local next_lbl="${1:-Siguiente}" allow_back="${2:-1}" next_col="${3:-${C_BOLD}${C_GREEN}}"
   write_divider
   if [ "$allow_back" -eq 1 ]; then
     local nav_line="  [ESPACIO/→] ${next_lbl}   [←/Backspace] Anterior"
     if [ "${#nav_line}" -gt "$UI_W" ]; then
       nav_line="  [ESPACIO/→] ${next_lbl}   [←] Anterior"
     fi
-    ui_line "${C_BOLD}${C_GREEN}" "$nav_line"
+    if [ "${#nav_line}" -gt "$UI_W" ]; then
+      nav_line="  [ESPACIO] ${next_lbl}  [←] Atras"
+    fi
+    ui_line "$next_col" "$nav_line"
   else
-    ui_line "${C_BOLD}${C_GREEN}" "  [ESPACIO/→] $next_lbl"
+    ui_line "$next_col" "  [ESPACIO/→] $next_lbl"
   fi
-  local help_line="  [1-6] Seccion   [R] Actualizar   [B] Eureka   [U] Utilidades   [Q] Salir"
-  [ "$UI_W" -lt 76 ] && help_line="  [1-6] Sec   [R] Re-ejec   [B] Eureka   [U] Utils   [Q] Salir"
+  local help_line
+  if [ "$UI_W" -ge 90 ]; then
+    help_line="  [1-6] Seccion  [R] Actualizar  [M] Inicio  [B] Eureka  [U] Utils  [?] Ayuda  [Q] Salir"
+  elif [ "$UI_W" -ge 77 ]; then
+    help_line="  [1-6] Sec  [R] Act  [M] Inicio  [B] Eureka  [U] Utils  [?] Ayuda  [Q] Salir"
+  else
+    help_line="  [1-6] Ir [R] Act [M] Inicio [B] Eur [U] Util [?] Ayuda [Q] Sal"
+  fi
   ui_line "$C_DIM" "$help_line"
   end_frame
   while true; do
@@ -506,6 +543,40 @@ wait_slide_footer() {
       *)            return ;;
     esac
   done
+}
+
+show_help_modal() {
+  FIRST_FRAME=1
+  LAST_SCREEN_ID="HELP"
+  while true; do
+    begin_frame
+    printf '%s%s╔%s╗%s%s\n' "$MARGIN" "$C_CYAN" "$(repeat_char '═' "$((UI_W - 2))")" "$C_RESET" "$CLR_EOL"
+    printf '%s%s║ %s%s%s ║%s%s\n' "$MARGIN" "$C_CYAN" "${C_BOLD}${C_CYAN}" "$(pad_center "AYUDA RAPIDA Y ATAJOS DEL PRESENTADOR" "$INNER_W")" "$C_CYAN" "$C_RESET" "$CLR_EOL"
+    printf '%s%s╚%s╝%s%s\n' "$MARGIN" "$C_CYAN" "$(repeat_char '═' "$((UI_W - 2))")" "$C_RESET" "$CLR_EOL"
+    ui_blank
+    box_top "NAVEGACION Y CONTROL" "$C_CYAN"
+    box_line "Espacio/Enter/->/N : Siguiente diapositiva" "$C_WHITE" "$C_CYAN"
+    box_line "<- / Backspace / A : Anterior (desde cache sin mutar)" "$C_WHITE" "$C_CYAN"
+    box_line "1 .. 6             : Saltar directo a Seccion 1..6" "$C_WHITE" "$C_CYAN"
+    box_line "R                  : Re-ejecutar en vivo el slide actual" "$C_YELLOW" "$C_CYAN"
+    box_line "M / Esc            : Volver a la Portada principal" "$C_WHITE" "$C_CYAN"
+    box_line "B / U / W          : Abrir Eureka / Utilidades / Dock" "$C_WHITE" "$C_CYAN"
+    box_line "H / ? / F1   |   Q : Abrir esta ayuda   |   Salir" "$C_DIM" "$C_CYAN"
+    box_bottom "$C_CYAN"
+    ui_blank
+    box_top "SIGNIFICADO DE ESTADOS E INDICADORES" "$C_CYAN"
+    box_line "● En linea (verde)   ~ Arranque (amarillo)   ! / ✗ Caido" "$C_WHITE" "$C_CYAN"
+    box_line "[EN VIVO] Prueba actual   [CACHE · R] Vista guardada" "$C_WHITE" "$C_CYAN"
+    box_bottom "$C_CYAN"
+    write_divider
+    ui_line "${C_BOLD}${C_GREEN}" "  [Cualquier tecla] Volver exactamente donde estabas"
+    end_frame
+    [ ! -t 0 ] && break
+    read_slide_key_live 0
+    [ "$ACT" = "RESIZE" ] && continue
+    break
+  done
+  FIRST_FRAME=1
 }
 
 api_req() {
@@ -657,21 +728,54 @@ PY
 
 # --- Panel de Utilidades ---
 
+test_docker_ready() {
+  docker info >/dev/null 2>&1
+}
+
 show_clean_prep() {
   LAST_SCREEN_ID="PREP"
   begin_frame 1
   printf '%s%s╔%s╗%s%s\n' "$MARGIN" "$C_YELLOW" "$(repeat_char '═' "$((UI_W - 2))")" "$C_RESET" "$CLR_EOL"
-  printf '%s%s║ %s%s%s ║%s%s\n' "$MARGIN" "$C_YELLOW" "$C_YELLOW" "$(pad_fixed "REINICIO LIMPIO DEL ENTORNO (down -v + up -d --build)" "$INNER_W")" "$C_YELLOW" "$C_RESET" "$CLR_EOL"
+  printf '%s%s║ %s%s%s ║%s%s\n' "$MARGIN" "$C_YELLOW" "$C_YELLOW" "$(pad_center "REINICIO LIMPIO DEL ENTORNO (down -v + up -d --build)" "$INNER_W")" "$C_YELLOW" "$C_RESET" "$CLR_EOL"
   printf '%s%s╚%s╝%s%s\n' "$MARGIN" "$C_YELLOW" "$(repeat_char '═' "$((UI_W - 2))")" "$C_RESET" "$CLR_EOL"
   ui_blank
+  if ! test_docker_ready; then
+    box_top "DOCKER NO DISPONIBLE" "$C_RED"
+    box_line "[ERROR] Docker Desktop / daemon no esta ejecutandose." "$C_RED" "$C_RED"
+    box_line "Inicia Docker y vuelve a intentarlo." "$C_WHITE" "$C_RED"
+    box_bottom "$C_RED"
+    wait_slide_footer "Volver" 0 "$C_YELLOW"
+    FIRST_FRAME=1
+    return
+  fi
+  if [ -t 0 ]; then
+    box_top "CONFIRMAR ACCION DESTRUCTIVA" "$C_YELLOW"
+    box_line "[!] Se ejecutara: docker compose down -v + up -d --build" "$C_YELLOW" "$C_YELLOW"
+    box_line "Se reiniciaran volumenes de BD y balances actuales." "$C_WHITE" "$C_YELLOW"
+    box_bottom "$C_YELLOW"
+    ui_blank
+    ui_line "$C_YELLOW" "  [S] Confirmar reinicio limpio   [Otra tecla] Cancelar"
+    end_frame
+    local ck=""
+    IFS= read -rsn1 ck || ck=""
+    case "$ck" in
+      s|S) ui_blank ;;
+      *)
+        ui_line "$C_DIM" "  [Cancelado] No se realizaron cambios en los contenedores."
+        sleep 1
+        FIRST_FRAME=1
+        return
+        ;;
+    esac
+  fi
   ensure_env || { wait_slide_footer "Volver" 0; FIRST_FRAME=1; return; }
   ui_line "$C_CYAN" "  \$ docker compose down -v && docker compose up -d --build"
   docker compose down -v
   docker compose up -d --build || {
     printf '\n  %s[ERROR] docker compose up fallo.%s\n' "$C_RED" "$C_RESET"
-    wait_slide_footer "Volver" 0; FIRST_FRAME=1; return
+    wait_slide_footer "Volver" 0 "$C_YELLOW"; FIRST_FRAME=1; return
   }
-  printf '\n  %sEsperando que los 8 contenedores esten healthy...%s\n' "$C_YELLOW" "$C_RESET"
+  printf '\n  %sEsperando que los 8 contenedores esten healthy…%s\n' "$C_YELLOW" "$C_RESET"
   local start_t now elapsed
   start_t=$(date +%s)
   while true; do
@@ -699,13 +803,15 @@ show_utils_panel() {
     begin_frame
     DOCK_ROW=$((PAD_T + 4))
     printf '%s%s╔%s╗%s%s\n' "$MARGIN" "$C_CYAN" "$(repeat_char '═' "$((UI_W - 2))")" "$C_RESET" "$CLR_EOL"
-    printf '%s%s║ %s%s%s ║%s%s\n' "$MARGIN" "$C_CYAN" "$C_CYAN" "$(pad_fixed "UTILIDADES DEL ENTORNO Y VERIFICACION" "$INNER_W")" "$C_CYAN" "$C_RESET" "$CLR_EOL"
+    printf '%s%s║ %s%s%s ║%s%s\n' "$MARGIN" "$C_CYAN" "$C_CYAN" "$(pad_center "UTILIDADES DEL ENTORNO Y VERIFICACION" "$INNER_W")" "$C_CYAN" "$C_RESET" "$CLR_EOL"
     printf '%s%s╚%s╝%s%s\n' "$MARGIN" "$C_CYAN" "$(repeat_char '═' "$((UI_W - 2))")" "$C_RESET" "$CLR_EOL"
     render_cluster_dock
 
     ui_blank
     if [ ! -f "$REPO_DIR/.env" ]; then
       ui_line "$C_YELLOW" "  [AVISO] Falta .env en el repositorio (pulsa [C] o [P])."
+    else
+      ui_line "$C_DIM" "  [OK] Archivo .env configurado."
     fi
     local sinfo
     if sinfo="$(get_saldo_line | tr -d '\r')"; then
@@ -716,27 +822,49 @@ show_utils_panel() {
     fi
     ui_blank
     box_top "ACCIONES DISPONIBLES" "$C_CYAN"
-    box_line "[P] Reinicio limpio (down -v + up -d --build + abrir Eureka)" "$C_YELLOW" "$C_CYAN"
+    box_line "[P] Reinicio limpio (down -v + up -d --build + Eureka)" "$C_YELLOW" "$C_CYAN"
     box_line "[S] Arrancar contenedores detenidos (docker compose start)" "$C_WHITE" "$C_CYAN"
-    box_line "[B] Abrir Eureka en navegador ($EUREKA)" "$C_WHITE" "$C_CYAN"
-    box_line "[C] Crear .env desde .env.example" "$C_WHITE" "$C_CYAN"
+    local eb="[C] Verificar/crear .env   |   [B] Abrir Eureka ($EUREKA)"
+    [ "${#eb}" -gt "$INNER_W" ] && eb="[C] Crear .env  |  [B] Abrir Eureka ($EUREKA)"
+    [ "${#eb}" -gt "$INNER_W" ] && eb="[C] Crear .env  |  [B] Abrir Eureka en navegador"
+    box_line "$eb" "$C_WHITE" "$C_CYAN"
     box_line "[T] Ejecutar suite automatizada P01-P08" "$C_WHITE" "$C_CYAN"
-    box_line "[1..6] Ir directo a Seccion 1..6" "$C_CYAN" "$C_CYAN"
-    box_line "[ESPACIO / ESC / M] Volver a la Portada" "$C_GREEN" "$C_CYAN"
+    box_line "[1..6] Ir a Seccion 1..6   |   [W] Refrescar monitor" "$C_CYAN" "$C_CYAN"
+    box_line "[M / Esc] Volver a Portada |   [?] Ayuda  |  [Q] Salir" "$C_GREEN" "$C_CYAN"
     box_bottom "$C_CYAN"
     end_frame
 
     read_slide_key_live 1
     case "$ACT" in
       RESIZE)       continue ;;
+      HELP)         show_help_modal ;;
       PREP)         show_clean_prep ;;
-      STARTALL)     begin_frame 1; ensure_env || true; docker compose start; fetch_dock_sync; wait_slide_footer "Volver" 0; FIRST_FRAME=1 ;;
+      STARTALL)
+        begin_frame 1
+        if ! test_docker_ready; then
+          ui_line "$C_RED" "  [ERROR] Docker / daemon no responde."
+        else
+          ensure_env || true; docker compose start; fetch_dock_sync
+        fi
+        wait_slide_footer "Volver" 0; FIRST_FRAME=1
+        ;;
       EUREKA)       open_eureka ;;
       DOCK_REFRESH) fetch_dock_sync; update_dock_in_place ;;
-      ENV)          ensure_env; sleep 1 ;;
+      ENV)
+        if [ -f "$REPO_DIR/.env" ]; then
+          ui_line "$C_GREEN" "  [OK] El archivo .env ya existe."
+        else
+          ensure_env || true
+        fi
+        sleep 1
+        ;;
       SUITE)
         begin_frame 1
-        [ -f "$REPO_DIR/docs/api/curl-p01-p08.sh" ] && bash "$REPO_DIR/docs/api/curl-p01-p08.sh"
+        if [ -f "$REPO_DIR/docs/api/curl-p01-p08.sh" ]; then
+          bash "$REPO_DIR/docs/api/curl-p01-p08.sh"
+        else
+          ui_line "$C_YELLOW" "  [AVISO] No se encontro docs/api/curl-p01-p08.sh"
+        fi
         wait_slide_footer "Volver" 0
         FIRST_FRAME=1
         ;;
@@ -750,7 +878,7 @@ show_utils_panel() {
 # --- Diapositivas 01 a 15 ---
 
 slide_01() {
-  slide_chrome 1 1 "Arquitectura del Sistema · 8 Contenedores Docker"
+  slide_chrome 1 1 "Arquitectura del Sistema · 8 Contenedores Docker" 0 0
   ui_blank
   box_top "FLUJO Y TOPOLOGIA DE RED (wallet-net)" "$C_CYAN"
   if [ "$INNER_W" -ge 71 ]; then
@@ -780,33 +908,35 @@ slide_01() {
   fi
   box_bottom "$C_CYAN"
   if [ "$INNER_W" -ge 70 ]; then
-    ui_line "$C_DIM" "  ● Gateway balancea HTTP; Postgres separa escrituras y lecturas."
+    ui_line "$C_DIM" "  ● Gateway balancea HTTP; PostgreSQL separa escrituras y lecturas."
   else
-    ui_line "$C_DIM" "  ● Gateway balancea HTTP; Postgres separa write/read."
+    ui_line "$C_DIM" "  ● Gateway balancea HTTP; PostgreSQL separa write/read."
   fi
   wait_slide_footer "Detalle del clúster"
 }
 
 slide_02() {
   local use_cache="${1:-0}"
-  slide_chrome 2 1 "Clúster Docker Compose · Estado de Servicios"
+  slide_chrome 2 1 "Clúster Docker Compose · Estado de Servicios" "$use_cache" 1
   ui_blank
   if [ "$use_cache" -eq 0 ] || [ "$CACHE_PS_READY" -eq 0 ]; then
+    show_pending_msg "Consultando estado de contenedores (docker compose ps)…"
     if docker compose ps -a --format '{{.Name}}|{{.Service}}|{{.Status}}|{{.Ports}}' > "$TMP/ps_raw.txt" 2>/dev/null; then
       CACHE_PS_READY=1
     else
       : > "$TMP/ps_raw.txt"
       CACHE_PS_READY=0
     fi
+    restore_pending_msg
   fi
   box_top "TELEMETRIA DE CONTENEDORES (docker compose ps)" "$C_CYAN"
   if [ "$CACHE_PS_READY" -eq 1 ] && [ -s "$TMP/ps_raw.txt" ]; then
     local show_ports=0
     [ "$INNER_W" -ge 72 ] && show_ports=1
     if [ "$show_ports" -eq 1 ]; then
-      box_line "$(printf '%-18s %-16s %-23s %s' "CONTENEDOR" "SERVICIO" "ESTADO" "PUERTOS")" "$C_CYAN" "$C_CYAN"
+      box_line "$(printf '%-18s %-16s %-23s %s' "CONTENEDOR" "SERVICIO" "ESTADO" "PUERTOS")" "$C_DIM" "$C_CYAN"
     else
-      box_line "$(printf '%-18s %-16s %s' "CONTENEDOR" "SERVICIO" "ESTADO")" "$C_CYAN" "$C_CYAN"
+      box_line "$(printf '%-18s %-16s %s' "CONTENEDOR" "SERVICIO" "ESTADO")" "$C_DIM" "$C_CYAN"
     fi
     while IFS='|' read -r cname svc status ports; do
       [ -z "$cname" ] && continue
@@ -822,7 +952,8 @@ slide_02() {
       fi
     done < <(tr -d '\r' < "$TMP/ps_raw.txt")
   else
-    box_line "No se pudo consultar docker compose (verifica Docker)." "$C_RED" "$C_CYAN"
+    box_line "[ERROR] Sin respuesta de docker compose." "$C_RED" "$C_CYAN"
+    box_line "Accion: Verifica Docker activo o inicia con [U] -> [S]." "$C_YELLOW" "$C_CYAN"
   fi
   box_bottom "$C_CYAN"
   wait_slide_footer "2. Descubrimiento en Eureka"
@@ -830,16 +961,18 @@ slide_02() {
 
 slide_03() {
   local use_cache="${1:-0}"
-  slide_chrome 3 2 "Descubrimiento Dinámico con Netflix Eureka"
+  slide_chrome 3 2 "Descubrimiento Dinámico con Netflix Eureka" "$use_cache" 1
   ui_blank
   box_top "ARQUITECTURA DE DESCUBRIMIENTO" "$C_CYAN"
   box_line "● Auto-registro al iniciar y latido (heartbeat) cada 5s." "$C_WHITE" "$C_CYAN"
-  box_line "● Gateway resuelve via lb://ms-cuentas, sin IPs fijas." "$C_WHITE" "$C_CYAN"
+  box_line "● Gateway resuelve vía lb://ms-cuentas, sin IPs fijas." "$C_WHITE" "$C_CYAN"
   box_bottom "$C_CYAN"
   ui_blank
   if [ "$use_cache" -eq 0 ] || [ -z "$CACHE_EUREKA_CODE" ]; then
+    show_pending_msg "Consultando registro en Eureka (:8761/eureka/apps)…"
     CACHE_EUREKA_CODE="$(api_req GET "$EUREKA/eureka/apps" "" 5)"
     cp "$BODY_FILE" "$TMP/eureka_cache.json" 2>/dev/null || true
+    restore_pending_msg
   fi
   box_top "REGISTRO EUREKA EN VIVO (:8761/eureka/apps)" "$C_GREEN"
   if [ "$CACHE_EUREKA_CODE" = "200" ]; then
@@ -883,8 +1016,11 @@ PY
         ;;
       *) box_line "Respuesta Eureka OK (HTTP 200)." "$C_GREEN" "$C_GREEN" ;;
     esac
+  elif [ "$CACHE_EUREKA_CODE" = "000" ]; then
+    box_line "Sin conexion con Eureka ($EUREKA)." "$C_RED" "$C_GREEN"
+    box_line "Accion: Revisa [U] Utilidades o pulsa [R] para reintentar." "$C_YELLOW" "$C_GREEN"
   else
-    box_line "No responde Eureka en $EUREKA (HTTP $CACHE_EUREKA_CODE)." "$C_RED" "$C_GREEN"
+    box_line "Eureka no responde (HTTP $CACHE_EUREKA_CODE). Pulsa [R] para reintentar." "$C_RED" "$C_GREEN"
   fi
   box_bottom "$C_GREEN"
   wait_slide_footer "Balanceo HTTP Round Robin"
@@ -892,15 +1028,15 @@ PY
 
 slide_04() {
   local use_cache="${1:-0}"
-  slide_chrome 4 2 "Balanceo de Carga HTTP · Round Robin"
+  slide_chrome 4 2 "Balanceo de Carga HTTP · Round Robin" "$use_cache" 1
   ui_blank
-  if [ "$INNER_W" -ge 64 ]; then
-    ui_line "$C_CYAN" "  20 peticiones a GET $GATEWAY/api/cuentas/instancia"
-  else
-    ui_line "$C_CYAN" "  20x GET /api/cuentas/instancia"
-  fi
+  local sub="  Objetivo: Verificar reparto 50/50 en GET $GATEWAY/api/cuentas/instancia"
+  [ "${#sub}" -gt "$INNER_W" ] && sub="  Objetivo: Reparto 50/50 en GET /api/cuentas/instancia (20 peticiones)"
+  [ "${#sub}" -gt "$INNER_W" ] && sub="  20x GET /api/cuentas/instancia (Round Robin)"
+  ui_line "$C_CYAN" "$sub"
   ui_blank
   if [ "$use_cache" -eq 0 ] || [ "$CACHE_BAL_READY" -eq 0 ]; then
+    show_pending_msg "Ejecutando 20 peticiones HTTP GET contra Gateway :8080…"
     : > "$TMP/balanceo.txt"
     local i code inst ok_cnt=0
     for i in $(seq 1 20); do
@@ -911,11 +1047,13 @@ slide_04() {
     done
     CACHE_BAL_OK="$ok_cnt"
     CACHE_BAL_READY=1
+    restore_pending_msg
   fi
   local bar_w=$((INNER_W - 42))
   [ "$bar_w" -gt 30 ] && bar_w=30
   [ "$bar_w" -lt 8 ] && bar_w=8
-  box_top "DISTRIBUCION POR INSTANCIA" "$C_GREEN"
+  box_top "DISTRIBUCION POR INSTANCIA (20 PETICIONES)" "$C_GREEN"
+  box_line "$(printf '%-20s %-5s  %-*s  %s' "INSTANCIA" "HTTP" "$bar_w" "REPARTO" "CONTEO")" "$C_DIM" "$C_GREEN"
   sort "$TMP/balanceo.txt" | uniq -c | while read -r cnt code inst; do
     local pct=$(( (cnt * 100) / 20 ))
     local filled=$(( (cnt * bar_w + 10) / 20 )); [ "$filled" -gt "$bar_w" ] && filled="$bar_w"
@@ -925,6 +1063,9 @@ slide_04() {
     echo "$inst" | grep -q 'ms-cuentas-2' && [ "$code" = "200" ] && col="$C_CYAN"
     box_line "$(printf '%-20s [%s]  %s  %2d/20 (%3d%%)' "$inst" "$code" "$bar_str" "$cnt" "$pct")" "$col" "$C_GREEN"
   done
+  if [ "$CACHE_BAL_OK" -eq 0 ] && grep -q '^000 ' "$TMP/balanceo.txt"; then
+    box_line "Gateway sin respuesta (HTTP 000). Revisa api-gateway en [U]." "$C_YELLOW" "$C_GREEN"
+  fi
   box_bottom "$C_GREEN"
   local err_cnt=$((20 - CACHE_BAL_OK))
   local pcol="$C_GREEN"; [ "$err_cnt" -ne 0 ] && pcol="$C_RED"
@@ -934,7 +1075,7 @@ slide_04() {
 
 slide_05() {
   local use_cache="${1:-0}" code
-  slide_chrome 5 3 "Orquestación P2P entre Microservicios · Transferencia"
+  slide_chrome 5 3 "Orquestación P2P entre Microservicios · ACID" "$use_cache" 1
   ui_blank
   local flow="  POST :8080 ─► ms-transacciones ─► ms-cuentas ─ACID─► PRIMARY"
   if [ "$INNER_W" -ge 88 ]; then
@@ -946,19 +1087,24 @@ slide_05() {
   ui_blank
 
   if [ "$use_cache" -eq 0 ] || [ -z "$CACHE_TX_OK_FILE" ] || [ ! -f "$CACHE_TX_OK_FILE" ]; then
+    show_pending_msg 'Ejecutando transferencia P2P de prueba ($25.00)…'
     local payload="{\"celularOrigen\":\"$ORIGEN\",\"celularDestino\":\"$DESTINO\",\"monto\":25,\"motivo\":\"Transferencia P2P\"}"
     code="$(api_req POST "$GATEWAY/api/transacciones/transferir" "$payload" 10)"
     cp "$BODY_FILE" "$TMP/cache_tx_ok.json"
     printf '%s' "$code" > "$TMP/cache_tx_ok.code"
     CACHE_TX_OK_FILE="$TMP/cache_tx_ok.json"
+    restore_pending_msg
   else
     code="$(cat "$TMP/cache_tx_ok.code")"
   fi
 
-  local bcol="$C_YELLOW"; [ "$code" = "201" ] || [ "$code" = "200" ] && bcol="$C_GREEN"
+  local bcol="$C_YELLOW"
+  [ "$code" = "201" ] || [ "$code" = "200" ] && bcol="$C_GREEN"
+  [ "$code" = "000" ] && bcol="$C_RED"
   local fields msg cod sal ic nbd pol
   fields="$(extract_transfer_fields "$CACHE_TX_OK_FILE" | tr -d '\r')"
   IFS='|' read -r msg cod sal ic nbd pol <<< "$fields"
+  [ "$code" = "000" ] && msg="Sin conexion con Gateway :8080 ([U]/[R])"
   [ "$nbd" != "-" ] && LAST_TX_NODO="$nbd"
   [ "$cod" != "-" ] && LAST_TX_CODIGO="$cod"
 
@@ -974,7 +1120,7 @@ slide_05() {
   box_line "Saldo Origen Post. : \$$sal  ($ORIGEN -> $DESTINO)" "$C_WHITE" "$bcol"
   box_line "Instancia Cuentas  : $ic" "$C_CYAN" "$bcol"
   box_line "${nbd_lbl}${nbd_disp}" "$C_YELLOW" "$bcol"
-  box_line "Politica Enrutado  : $pol" "$C_WHITE" "$bcol"
+  box_line "Política Enrutado  : $pol" "$C_WHITE" "$bcol"
   box_bottom "$bcol"
   local acid="  ● Debito y credito en una sola transaccion ACID con bloqueo ordenado."
   [ "$INNER_W" -lt 68 ] && acid="  ● Debito/credito en 1 transaccion ACID con bloqueo ordenado."
@@ -984,7 +1130,7 @@ slide_05() {
 
 slide_06() {
   local use_cache="${1:-0}" code
-  slide_chrome 6 3 "Validación de Reglas de Negocio · Error Controlado"
+  slide_chrome 6 3 "Validación de Reglas de Negocio · Error Controlado" "$use_cache" 1
   ui_blank
   local pnod="$(fmt_node_width "$LAST_TX_NODO")"
   if [ "$INNER_W" -ge 74 ]; then
@@ -995,11 +1141,13 @@ slide_06() {
   ui_blank
 
   if [ "$use_cache" -eq 0 ] || [ -z "$CACHE_TX_ERR_FILE" ] || [ ! -f "$CACHE_TX_ERR_FILE" ]; then
+    show_pending_msg 'Validando rechazo controlado (monto $9999.00 > saldo)…'
     local payload="{\"celularOrigen\":\"$ORIGEN\",\"celularDestino\":\"$DESTINO\",\"monto\":9999,\"motivo\":\"Prueba limite\"}"
     code="$(api_req POST "$GATEWAY/api/transacciones/transferir" "$payload" 10)"
     cp "$BODY_FILE" "$TMP/cache_tx_err.json"
     printf '%s' "$code" > "$TMP/cache_tx_err.code"
     CACHE_TX_ERR_FILE="$TMP/cache_tx_err.json"
+    restore_pending_msg
   else
     code="$(cat "$TMP/cache_tx_err.code")"
   fi
@@ -1008,14 +1156,15 @@ slide_06() {
   local fields msg cod sal ic nbd pol
   fields="$(extract_transfer_fields "$CACHE_TX_ERR_FILE" | tr -d '\r')"
   IFS='|' read -r msg cod sal ic nbd pol <<< "$fields"
+  [ "$code" = "000" ] && msg="Sin conexion con Gateway :8080 ([U]/[R])"
   local mlbl="Mensaje devuelto   : "
-  [ "$INNER_W" -lt 72 ] && mlbl="Mensaje  : "
+  [ $(( ${#msg} + 21 )) -gt "$INNER_W" ] && mlbl="Mensaje  : "
 
   box_top "RECHAZO CONTROLADO  [ HTTP $code ]" "$bcol"
   box_line "${mlbl}${msg}" "$bcol" "$bcol"
   box_line "Monto solicitado   : \$9999.00  (supera saldo disponible)" "$C_WHITE" "$bcol"
   box_line "Integridad ACID    : Transaccion revertida; saldos intactos" "$C_GREEN" "$bcol"
-  box_line "Auditoria nodoBD   : $(fmt_node_width "$nbd")" "$C_CYAN" "$bcol"
+  box_line "Auditoría nodoBD   : $(fmt_node_width "$nbd")" "$C_CYAN" "$bcol"
   box_bottom "$bcol"
   wait_slide_footer "4. Persistencia replicada"
 }
@@ -1058,7 +1207,7 @@ fmt_node_width() {
 
 render_lecturas_from_cache() {
   local tag="$1" bcol="${2:-$C_GREEN}"
-  local max_node=20 dn
+  local max_node=16 dn
   while IFS='|' read -r _c _n _f; do
     dn="$(fmt_node_width "$_n")"
     [ "${#dn}" -gt "$max_node" ] && max_node="${#dn}"
@@ -1067,6 +1216,10 @@ render_lecturas_from_cache() {
   [ "$bar_w" -gt 18 ] && bar_w=18
   [ "$bar_w" -lt 4 ] && bar_w=4
   box_top "20 LECTURAS ORDINARIAS (contactos + historial)" "$bcol"
+  local bar_lbl="REPARTO"; [ "$bar_w" -lt 7 ] && bar_lbl="BAR"
+  local hdr_row
+  hdr_row="$(printf 'CANT  HTTP  %-*s  %-*s  FALLBACK' "$bar_w" "$bar_lbl" "$max_node" "NODO BD")"
+  [ "${#hdr_row}" -le "$INNER_W" ] && box_line "$hdr_row" "$C_DIM" "$bcol"
   sort "$TMP/lect_${tag}.txt" | uniq -c | while read -r line; do
     local cnt rest code node dnode fb filled bar_str col
     cnt="$(echo "$line" | awk '{print $1}')"
@@ -1078,7 +1231,7 @@ render_lecturas_from_cache() {
     filled=$(( (cnt * bar_w + 10) / 20 )); [ "$filled" -gt "$bar_w" ] && filled="$bar_w"
     bar_str="$(repeat_char '█' "$filled")$(repeat_char '░' "$((bar_w - filled))")"
     col="$C_GREEN"; [ "$fb" = "true" ] && col="$C_YELLOW"; [ "$code" != "200" ] && col="$C_RED"
-    box_line "$(printf '%2d/20 [%s] %s  %s  fb=%s' "$cnt" "$code" "$bar_str" "$dnode" "$fb")" "$col" "$bcol"
+    box_line "$(printf '%2d/20 [%s] %s  %-*s  fb=%s' "$cnt" "$code" "$bar_str" "$max_node" "$dnode" "$fb")" "$col" "$bcol"
   done
   box_bottom "$bcol"
   IFS='|' read -r LECT_OK LECT_ERR LECT_ERR_DETAIL LECT_FB LECT_SEC < "$TMP/lect_meta_${tag}.txt"
@@ -1086,7 +1239,7 @@ render_lecturas_from_cache() {
 
 slide_07() {
   local use_cache="${1:-0}"
-  slide_chrome 7 4 "Enrutamiento de Base de Datos · Primario vs Réplicas"
+  slide_chrome 7 4 "Enrutamiento BD · Primario vs Réplicas WAL" "$use_cache" 1
   ui_blank
   local wnod="$(fmt_node_width "$LAST_TX_NODO")"
   if [ "$INNER_W" -ge 80 ]; then
@@ -1096,8 +1249,10 @@ slide_07() {
   fi
   ui_blank
   if [ "$use_cache" -eq 0 ] || [ "$CACHE_LECT07_READY" -eq 0 ]; then
+    show_pending_msg "Ejecutando 20 lecturas ordinarias (contactos + historial)…"
     fetch_lecturas_data "07"
     CACHE_LECT07_READY=1
+    restore_pending_msg
   fi
   render_lecturas_from_cache "07" "$C_GREEN"
   local col="$C_GREEN"; [ "$LECT_ERR" -gt 0 ] && col="$C_RED"
@@ -1107,21 +1262,23 @@ slide_07() {
 
 slide_08() {
   local use_cache="${1:-0}"
-  slide_chrome 8 4 "Consistencia Inmediata · Read-Your-Own-Writes (RYOW)"
+  slide_chrome 8 4 "Consistencia Inmediata · Read-Your-Own-Writes" "$use_cache" 1
   ui_blank
   box_top "ARQUITECTURA DE CONSISTENCIA" "$C_CYAN"
   if [ "$INNER_W" -ge 68 ]; then
-    box_line "● Las replicas WAL pueden presentar retardo minimo tras escribir." "$C_WHITE" "$C_CYAN"
+    box_line "● Las réplicas WAL pueden presentar retardo mínimo tras escribir." "$C_WHITE" "$C_CYAN"
     box_line "● /saldo-critico fuerza lectura al PRIMARIO (RYOW garantizado)." "$C_WHITE" "$C_CYAN"
   else
-    box_line "● Replicas WAL pueden tener retardo minimo tras escribir." "$C_WHITE" "$C_CYAN"
+    box_line "● Réplicas WAL pueden tener retardo mínimo tras escribir." "$C_WHITE" "$C_CYAN"
     box_line "● /saldo-critico fuerza lectura en PRIMARIO (RYOW)." "$C_WHITE" "$C_CYAN"
   fi
   box_bottom "$C_CYAN"
   ui_blank
   if [ "$use_cache" -eq 0 ] || [ -z "$CACHE_CRIT_CODE" ]; then
+    show_pending_msg "Consultando /saldo-critico directo al PRIMARIO…"
     CACHE_CRIT_CODE="$(api_req GET "$GATEWAY/api/cuentas/$ORIGEN/saldo-critico" "" 5)"
     cp "$BODY_FILE" "$TMP/crit_cache.json" 2>/dev/null || true
+    restore_pending_msg
   fi
   local box_t8="LECTURA CRITICA  [ GET /api/cuentas/$ORIGEN/saldo-critico ]"
   [ "$INNER_W" -lt 68 ] && box_t8="LECTURA CRITICA (GET /saldo-critico)"
@@ -1132,17 +1289,19 @@ slide_08() {
     IFS='|' read -r sal nbd pol <<< "$fields"
     box_line "Saldo inmediato    : \$$sal" "$C_GREEN" "$C_GREEN"
     box_line "Nodo Base de Datos : $(fmt_node_width "$nbd")" "$C_CYAN" "$C_GREEN"
-    box_line "Politica Enrutado  : $pol" "$C_YELLOW" "$C_GREEN"
+    box_line "Política Enrutado  : $pol" "$C_YELLOW" "$C_GREEN"
+  elif [ "$CACHE_CRIT_CODE" = "000" ]; then
+    box_line "Sin conexion con Gateway :8080 — Verifica cluster con [U]." "$C_RED" "$C_GREEN"
   else
     box_line "HTTP $CACHE_CRIT_CODE al consultar saldo-critico" "$C_RED" "$C_GREEN"
   fi
   box_bottom "$C_GREEN"
-  wait_slide_footer "5. Simulación de fallos"
+  wait_slide_footer "5. Simulación de fallos (en vivo)" 1 "$C_YELLOW"
 }
 
 slide_09() {
   local use_cache="${1:-0}"
-  slide_chrome 9 5 "Alta Disponibilidad HTTP · Caída de ms-cuentas-2"
+  slide_chrome 9 5 "Alta Disponibilidad HTTP · Caída ms-cuentas-2" "$use_cache" 1
 
   if [ "$use_cache" -eq 1 ] && [ "${#LAST_BURST_LINES[@]}" -gt 0 ]; then
     ui_blank
@@ -1159,24 +1318,24 @@ slide_09() {
   fi
 
   local phase=1 total_req=0 err_req=0 c1=0 c2=0
-  local event_msg="Trafico continuo activo contra Gateway :8080"
+  local event_msg="Tráfico continuo activo contra Gateway :8080"
   local ring=() abort_act="" hdr="$TMP/traf_hdr.txt" code inst ts col
   local stop_trig_ms=0 start_trig_ms=0 detect_ms=-1 rejoin_ms=-1 consec_c1=0 streak_ms=0 now_m
   : > "$TMP/s9_errs.txt"
 
   render_s9_body() {
     [ -t 1 ] && printf '\033[%d;1H' "$((DOCK_ROW + 4))"
-    local status_txt err_codes="" tot_line
+    local status_txt err_codes="" tot_line s9_hint
     if [ "$INNER_W" -ge 74 ]; then
       case "$phase" in
-        1) status_txt="Trafico activo (ms-cuentas-1 + ms-cuentas-2)  |  [ESPACIO] Detener :8082" ;;
-        2) status_txt="ms-cuentas-2 DETENIDA · Midiendo deteccion  |  [ESPACIO] Reiniciar :8082" ;;
+        1) status_txt="Tráfico activo (ms-cuentas-1 + ms-cuentas-2)  |  [ESPACIO] Detener :8082" ;;
+        2) status_txt="ms-cuentas-2 DETENIDA · Midiendo detección  |  [ESPACIO] Reiniciar :8082" ;;
         3) status_txt="Recuperando instancia (~25s JVM)              |  [ESPACIO] Ver resumen" ;;
       esac
     else
       case "$phase" in
         1) status_txt="Activo (:8081 + :8082) | [ESPACIO] Detener :8082" ;;
-        2) status_txt=":8082 DETENIDA (deteccion) | [ESPACIO] Reiniciar" ;;
+        2) status_txt=":8082 DETENIDA (detección) | [ESPACIO] Reiniciar" ;;
         3) status_txt="Recuperando JVM (~25s) | [ESPACIO] Ver resumen" ;;
       esac
     fi
@@ -1204,12 +1363,18 @@ slide_09() {
     done
     box_bottom "$C_DIM"
     printf '%s  %s%s%s%s\n' "$MARGIN" "$C_CYAN" "$(pad_fixed "$event_msg" "$INNER_W")" "$C_RESET" "$CLR_EOL"
+    if [ "$UI_W" -ge 78 ]; then
+      s9_hint="  [ESPACIO] Accion fase   [←] Atras   [B] Eureka   [M] Inicio   [?] Ayuda   [Q] Salir"
+    else
+      s9_hint="  [ESPACIO] Fase  [←] Atras  [B] Eur  [M] Inicio  [?] Ayuda  [Q] Salir"
+    fi
+    ui_line "$C_DIM" "$s9_hint"
     end_frame
   }
 
   while true; do
     if [ "$RESIZED" -eq 1 ]; then
-      slide_chrome 9 5 "Alta Disponibilidad HTTP · Caída de ms-cuentas-2"
+      slide_chrome 9 5 "Alta Disponibilidad HTTP · Caída ms-cuentas-2" 0 1
     fi
     start_dock_probe_bg
 
@@ -1260,6 +1425,11 @@ slide_09() {
       case "$ACT" in
         QUIT|HOME|PREV|B[1-6]) abort_act="$ACT"; break ;;
         EUREKA) open_eureka ;;
+        HELP)
+          show_help_modal
+          slide_chrome 9 5 "Alta Disponibilidad HTTP · Caída ms-cuentas-2" 0 1
+          render_s9_body
+          ;;
         *)
           if [ "$phase" -eq 1 ]; then
             phase=2
@@ -1300,12 +1470,12 @@ slide_09() {
   LAST_BURST_LINES=(
     "Total: $total_req  |  Exitosas (200): $((total_req - err_req))  |  Errores: $err_req"
     "Errores transitorios : $err_summary"
-    "Distribucion : ms-cuentas-1=$c1  |  ms-cuentas-2=$c2"
-    "Deteccion    : $det_str  |  Retorno: $rej_str"
-    "Limitacion   : Gateway reintenta GET (no POST /transferir)"
+    "Distribución : ms-cuentas-1=$c1  |  ms-cuentas-2=$c2"
+    "Detección    : $det_str  |  Retorno: $rej_str"
+    "Limitación   : Gateway reintenta GET (no POST /transferir)"
   )
 
-  slide_chrome 9 5 "Alta Disponibilidad HTTP · Errores y Tiempos Observados"
+  slide_chrome 9 5 "Alta Disponibilidad HTTP · Errores y Tiempos" 0 1
   ui_blank
   box_top "RESUMEN DE FALLO Y CONVERGENCIA" "$rcol"
   box_line "${LAST_BURST_LINES[0]}" "$rcol" "$rcol"
@@ -1318,38 +1488,41 @@ slide_09() {
 }
 
 slide_10() {
-  slide_chrome 10 5 "Alta Disponibilidad de Datos · Caída de Réplica PG"
+  slide_chrome 10 5 "Alta Disponibilidad BD · Caída de Réplica PG" 0 0
   ui_blank
-  box_top "ESCENARIO: FALLO DE NODO DE LECTURA EN CALIENTE" "$C_YELLOW"
-  box_line "" "$C_WHITE" "$C_YELLOW"
-  box_line "  ● Se detiene replica1 mientras el servicio recibe consultas." "$C_WHITE" "$C_YELLOW"
+  box_top "OBJETIVO Y MECANISMO DE FAILOVER EN CALIENTE" "$C_CYAN"
   if [ "$INNER_W" -ge 68 ]; then
-    box_line "  ● @UsarNodo captura la excepcion y reintenta sobre la replica" "$C_WHITE" "$C_YELLOW"
-    box_line "    sana (X-Db-Fallback: true) hasta que la sonda actua." "$C_WHITE" "$C_YELLOW"
-    box_line "" "$C_WHITE" "$C_YELLOW"
-    box_line "  PRUEBA: docker compose stop replica1  +  20 lecturas" "$C_CYAN" "$C_YELLOW"
+    box_line "● Objetivo : Verificar continuidad de lecturas si cae replica1." "$C_WHITE" "$C_CYAN"
+    box_line "● @UsarNodo: Captura el fallo SQL y reintenta en replica sana" "$C_WHITE" "$C_CYAN"
+    box_line "             marcando cabecera X-Db-Fallback: true." "$C_WHITE" "$C_CYAN"
+    box_line "● Sonda 3s : ReplicaHealthTracker retira replica1 tras fallar." "$C_WHITE" "$C_CYAN"
   else
-    box_line "  ● @UsarNodo reintenta sobre replica sana (X-Db-Fallback)" "$C_WHITE" "$C_YELLOW"
-    box_line "    hasta que la sonda cada 3s marca replica1 caida." "$C_WHITE" "$C_YELLOW"
-    box_line "" "$C_WHITE" "$C_YELLOW"
-    box_line "  PRUEBA: stop replica1 + 20 lecturas consecutivas" "$C_CYAN" "$C_YELLOW"
+    box_line "● Objetivo : Continuidad de lecturas ante caida de replica1." "$C_WHITE" "$C_CYAN"
+    box_line "● @UsarNodo: Reintenta en replica sana (X-Db-Fallback: true)." "$C_WHITE" "$C_CYAN"
+    box_line "● Sonda 3s : ReplicaHealthTracker retira replica1 al fallar." "$C_WHITE" "$C_CYAN"
   fi
-  box_line "" "$C_WHITE" "$C_YELLOW"
+  box_bottom "$C_CYAN"
+  ui_blank
+  box_top "ACCION EN VIVO AL AVANZAR (PREVENCION)" "$C_YELLOW"
+  box_line "[!] Se ejecutara: docker compose stop replica1 + 20 lecturas." "$C_YELLOW" "$C_YELLOW"
   box_bottom "$C_YELLOW"
-  wait_slide_footer "Caída replica1 + lecturas"
+  wait_slide_footer "[!] Ejecutar: stop replica1 + 20 lecturas" 1 "$C_YELLOW"
 }
 
 slide_11() {
   local use_cache="${1:-0}"
+  slide_chrome 11 5 "Failover Transparente · Lecturas sobre REPLICA_2" "$use_cache" 1
+  ui_blank
   if [ "$use_cache" -eq 0 ] || [ "$CACHE_LECT11_READY" -eq 0 ]; then
+    show_pending_msg "Deteniendo replica1 y ejecutando 20 lecturas con failover…"
     docker compose stop replica1 >/dev/null 2>&1 || true
     STOP_REP_MS="$(now_ms)"
     fetch_dock_sync
+    update_dock_in_place
     fetch_lecturas_data "11"
     CACHE_LECT11_READY=1
+    restore_pending_msg
   fi
-  slide_chrome 11 5 "Failover Transparente · Lecturas sobre REPLICA_2"
-  ui_blank
   ui_line "$C_CYAN" "  \$ docker compose stop replica1  [OK]"
   ui_blank
   render_lecturas_from_cache "11" "$C_YELLOW"
@@ -1415,6 +1588,8 @@ PY
         ;;
       *) box_line "$(cat "$json_file")" "$C_WHITE" "$C_CYAN" ;;
     esac
+  elif [ "$code" = "000" ]; then
+    box_line "Sin conexion con Gateway :8080 — Verifica cluster con [U]." "$C_RED" "$C_CYAN"
   else
     box_line "HTTP $code al consultar db/estado" "$C_RED" "$C_CYAN"
   fi
@@ -1423,37 +1598,42 @@ PY
 
 slide_12() {
   local use_cache="${1:-0}"
-  slide_chrome 12 5 "Detección Automática de Réplica Caída (Sondeo 3s)"
+  slide_chrome 12 5 "Detección Automática · Sondeo cada 3s" "$use_cache" 1
   ui_blank
   if [ "$use_cache" -eq 0 ] || [ -z "$CACHE_EST12_CODE" ]; then
+    show_pending_msg "Consultando estado de salud (/api/cuentas/db/estado)…"
     CACHE_EST12_CODE="$(api_req GET "$GATEWAY/api/cuentas/db/estado" "" 5)"
     cp "$BODY_FILE" "$TMP/est12_cache.json" 2>/dev/null || true
+    restore_pending_msg
   fi
   render_db_estado_box "SALUD DE REPLICAS (/api/cuentas/db/estado)" "$CACHE_EST12_CODE" "$TMP/est12_cache.json"
   ui_blank
   local elap="sondeo cada 3.0s"
   [ "$STOP_REP_MS" -gt 0 ] && elap="$(fmt_ms_sec $(( $(now_ms) - STOP_REP_MS )))s tras stop"
-  box_top "DETECCION Y LIMITACIONES" "$C_DIM"
-  box_line "● Deteccion: $elap (ReplicaHealthTracker, c/3s)." "$C_WHITE" "$C_DIM"
-  box_line "● Limitacion: failover solo lectura (no promueve PRIMARY)." "$C_YELLOW" "$C_DIM"
+  box_top "DETECCIÓN Y LIMITACIONES" "$C_DIM"
+  box_line "● Detección : $elap (ReplicaHealthTracker, c/3s)." "$C_WHITE" "$C_DIM"
+  box_line "● Limitación: failover solo lectura (no promueve PRIMARY)." "$C_YELLOW" "$C_DIM"
   box_bottom "$C_DIM"
-  wait_slide_footer "Reiniciar replica1 (recuperación WAL)"
+  wait_slide_footer "Reiniciar replica1 (recuperación WAL)" 1 "$C_CYAN"
 }
 
 slide_13() {
   local use_cache="${1:-0}"
+  slide_chrome 13 5 "Recuperación WAL · Reinicio de replica1" "$use_cache" 1
+  ui_blank
   if [ "$use_cache" -eq 0 ]; then
+    show_pending_msg "Reiniciando replica1 y actualizando monitor…"
     docker compose start replica1 >/dev/null 2>&1 || true
     START_REP_MS="$(now_ms)"
     fetch_dock_sync
+    update_dock_in_place
+    restore_pending_msg
   fi
-  slide_chrome 13 5 "Recuperación de Réplica · Streaming WAL y Umbral 2/2"
-  ui_blank
   ui_line "$C_CYAN" "  \$ docker compose start replica1  [OK]"
   ui_blank
   box_top "SINCRONIZACION AUTOMATICA EN CURSO" "$C_GREEN"
-  box_line "[✓] Contenedor replica1 reiniciado." "$C_GREEN" "$C_GREEN"
-  box_line "[~] Sincronizando registros WAL desde el nodo primario." "$C_YELLOW" "$C_GREEN"
+  box_line "[✓] Contenedor replica1 reiniciado y conectado al PRIMARY." "$C_GREEN" "$C_GREEN"
+  box_line "[~] Replicando registros WAL atrasados de forma continua." "$C_YELLOW" "$C_GREEN"
   box_line "[~] Umbral de retorno: 2 chequeos sanos seguidos (2 x 3s)." "$C_CYAN" "$C_GREEN"
   box_bottom "$C_GREEN"
   wait_slide_footer "Verificar retorno al Round-Robin"
@@ -1461,48 +1641,51 @@ slide_13() {
 
 slide_14() {
   local use_cache="${1:-0}"
-  slide_chrome 14 5 "Reincorporación Automática de replica1 al Round-Robin"
+  slide_chrome 14 5 "Reincorporación Automática · Umbral 2/2" "$use_cache" 1
   ui_blank
   if [ "$use_cache" -eq 0 ] || [ -z "$CACHE_EST14_CODE" ]; then
+    show_pending_msg "Consultando reincorporacion (/api/cuentas/db/estado)…"
     CACHE_EST14_CODE="$(api_req GET "$GATEWAY/api/cuentas/db/estado" "" 5)"
     cp "$BODY_FILE" "$TMP/est14_cache.json" 2>/dev/null || true
+    restore_pending_msg
   fi
   render_db_estado_box "SALUD DE REPLICAS TRAS RECUPERACION (/api/cuentas/db/estado)" "$CACHE_EST14_CODE" "$TMP/est14_cache.json"
   ui_blank
   local elap="~6-8s habituales"
   [ "$START_REP_MS" -gt 0 ] && elap="$(fmt_ms_sec $(( $(now_ms) - START_REP_MS )))s tras start"
   box_top "RETORNO AUTOMATICO Y LIMITACION" "$C_DIM"
-  box_line "● Retorno: $elap (2x pg_is_in_recovery=true)." "$C_WHITE" "$C_DIM"
-  box_line "● Limitacion: depende de wal_keep_size (usar slots en prod)." "$C_YELLOW" "$C_DIM"
+  box_line "● Retorno   : $elap (2x pg_is_in_recovery=true)." "$C_WHITE" "$C_DIM"
+  box_line "● Limitación: depende de wal_keep_size (usar slots en prod)." "$C_YELLOW" "$C_DIM"
+  box_line "● Tip       : si replica1 sigue iniciando, pulsa [R]." "$C_CYAN" "$C_DIM"
   box_bottom "$C_DIM"
   wait_slide_footer "6. Conclusiones técnicas"
 }
 
 slide_15() {
-  slide_chrome 15 6 "Conclusiones Técnicas · Decisiones, Limitaciones y Mejoras"
+  slide_chrome 15 6 "Conclusiones · Decisiones, Limitaciones, Mejoras" 0 0
   ui_blank
   if [ "$INNER_W" -ge 72 ]; then
     write_three_col_cards "DECISIONES" "LIMITACIONES" "MEJORAS FUTURAS" "$C_GREEN" "$C_YELLOW" "$C_CYAN" \
       "· BD por @UsarNodo|· Sin failover primario|· Failover (Patroni)" \
-      "  write->PRI  read->REP|· Eureka unico (SPOF)|· Claves idempotencia" \
-      "· Round Robin + salud|· /movimiento-interno|· Retry conexion en" \
+      "  write->PRI read->REP|· Eureka único (SPOF)|· Claves idempotencia" \
+      "· Round Robin + salud|· /movimiento-interno|· Retry conexión en" \
       "  chequeo 2 de 2|  expuesto en Gateway|  ms-transacciones" \
-      "· Eureka sin cache +|· Limite diario no se|· Health Eureka real" \
+      "· Eureka sin cache +|· Límite diario no se|· Health Eureka real" \
       "  retry GET (0 err P03)|  reinicia solo|· Bloquear ruta interna" \
       "· Flyway advisory lock|· Sin idempotencia P2P|  y Sagas / Outbox"
   else
     write_three_col_cards "DECISIONES" "LIMITACIONES" "MEJORAS" "$C_GREEN" "$C_YELLOW" "$C_CYAN" \
       "· @UsarNodo JDBC|· Sin failover PRI|· Failover Patroni" \
-      "  W:PRI R:REPLICA|· Eureka unico|· Idempotencia P2P" \
-      "· Round-Robin 2/2|· /mov-interno en|· Retry conexion" \
+      "  W:PRI R:REPLICA|· Eureka único|· Idempotencia P2P" \
+      "· Round-Robin 2/2|· /mov-interno en|· Retry conexión" \
       "  salud verificada|  ruta del Gateway|  ms-transacciones" \
-      "· Eureka sin cache|· Limite diario|· Health Eureka" \
+      "· Eureka sin cache|· Límite diario|· Health Eureka" \
       "  + retry GET GW|  sin auto-reset|· Cerrar /mov-int" \
       "· Flyway adv. lock|· Sin idempotencia|  + Sagas / Outbox"
   fi
-  local quote='"Mas de uno de todo, y saber esquivar al que falla. Sistema distribuido."'
+  local quote='"Más de uno de todo, y saber esquivar al que falla. Sistema distribuido."'
   [ "$INNER_W" -lt 74 ] && quote='"Replicar cada capa y esquivar al nodo que falla."'
-  box_top "SINTESIS FINAL" "$C_CYAN"
+  box_top "SÍNTESIS FINAL" "$C_CYAN"
   box_line "$(pad_center "$quote" "$INNER_W")" "$C_CYAN" "$C_CYAN"
   box_bottom "$C_CYAN"
   wait_slide_footer "Volver a Portada"
@@ -1531,6 +1714,7 @@ run_deck() {
     use_cache=0
     case "$ACT" in
       RESIZE) use_cache=1; continue ;;
+      HELP)   show_help_modal; use_cache=1; continue ;;
       PREV)
         [ "$idx" -eq 0 ] && { ACT="PORTADA"; return; }
         idx=$((idx - 1))
@@ -1558,9 +1742,9 @@ show_portada() {
     begin_frame
     DOCK_ROW=$((PAD_T + 5))
     local ptitle="BILLETERA DIGITAL DISTRIBUIDA · DEMO EN VIVO"
-    local psub="Replicacion PostgreSQL WAL, descubrimiento Eureka y failover"
+    local psub="Replicación PostgreSQL WAL, descubrimiento Eureka y failover"
     [ "$INNER_W" -lt 66 ] && ptitle="BILLETERA DIGITAL · DEMO EN VIVO"
-    [ "$INNER_W" -lt 70 ] && psub="Replicacion Postgres WAL, Eureka y tolerancia a fallos"
+    [ "$INNER_W" -lt 70 ] && psub="Replicación Postgres WAL, Eureka y tolerancia a fallos"
 
     printf '%s%s╔%s╗%s%s\n' "$MARGIN" "$C_CYAN" "$(repeat_char '═' "$((UI_W - 2))")" "$C_RESET" "$CLR_EOL"
     printf '%s%s║ %s%s%s ║%s%s\n' "$MARGIN" "$C_CYAN" "${C_BOLD}${C_CYAN}" "$(pad_center "$ptitle" "$INNER_W")" "$C_CYAN" "$C_RESET" "$CLR_EOL"
@@ -1573,39 +1757,45 @@ show_portada() {
     fi
     LAST_SCREEN_ID="PORTADA"
 
-    local leg="  ● En linea   ~ Iniciando   ✗ Caido     (actualizado en segundo plano)"
-    [ "$INNER_W" -lt 72 ] && leg="  ● En linea   ~ Iniciando   ✗ Caido"
+    local leg="  ● En línea   ~ Iniciando   ✗ Caído     (actualizado en segundo plano)"
+    [ "$INNER_W" -lt 72 ] && leg="  ● En línea   ~ Iniciando   ✗ Caído"
     ui_line "$C_DIM" "$leg"
     ui_blank
 
-    local ag_title="RECORRIDO (15 DIAPOSITIVAS) · ELIGE SECCION [1-6]"
+    local ag_title="RECORRIDO (15 DIAPOSITIVAS) · ELIGE SECCIÓN [1-6]"
     [ "$INNER_W" -lt 70 ] && ag_title="RECORRIDO (15 SLIDES) · PULSA [1-6]"
     box_top "$ag_title" "$C_CYAN"
     local col_l=$(( (INNER_W - 3) / 2 ))
     local col_r=$(( INNER_W - 3 - col_l ))
-    local ag_rows
+    local tw1=$((col_l - 11)) tw2=$((col_r - 11))
+    [ "$tw1" -lt 8 ] && tw1=8
+    [ "$tw2" -lt 8 ] && tw2=8
+    local ag_items
     if [ "$INNER_W" -ge 74 ]; then
-      ag_rows=(
-        "[1] Arquitectura y Docker  (01-02)|[4] Lecturas Replica y RYOW (07-08)"
-        "[2] Eureka y Balanceo HTTP (03-04)|[5] Caidas: App y Postgres  (09-14)"
-        "[3] Transferencia P2P ACID (05-06)|[6] Conclusiones Tecnicas      (15)"
+      ag_items=(
+        "[1]|Arquitectura y Docker|(01-02)|[4]|Lecturas Réplica/RYOW|(07-08)"
+        "[2]|Eureka y Balanceo HTTP|(03-04)|[5]|Caídas: App y Postgres|(09-14)"
+        "[3]|Transferencia P2P ACID|(05-06)|[6]|Conclusiones Técnicas|   (15)"
       )
     else
-      ag_rows=(
-        "[1] Arquitectura    (01-02)|[4] Lecturas y RYOW (07-08)"
-        "[2] Eureka/Balanceo (03-04)|[5] Fallos App/BD   (09-14)"
-        "[3] P2P Transf ACID (05-06)|[6] Conclusiones       (15)"
+      ag_items=(
+        "[1]|Arquitectura|(01-02)|[4]|Lecturas y RYOW|(07-08)"
+        "[2]|Eureka/Balanceo|(03-04)|[5]|Fallos App/BD|(09-14)"
+        "[3]|P2P Transf ACID|(05-06)|[6]|Conclusiones|   (15)"
       )
     fi
-    local ar lhs rhs
-    for ar in "${ag_rows[@]}"; do
-      lhs="${ar%%|*}"
-      rhs="${ar#*|}"
-      printf '%s%s│ %s%s %s│ %s%s%s │%s%s\n' \
+    local ar b1 t1 r1 b2 t2 r2
+    for ar in "${ag_items[@]}"; do
+      IFS='|' read -r b1 t1 r1 b2 t2 r2 <<< "$ar"
+      printf '%s%s│ %s%s %s%s%s%s %s│ %s%s %s%s%s%s%s │%s%s\n' \
         "$MARGIN" "$C_CYAN" \
-        "$C_WHITE" "$(pad_fixed "$lhs" "$col_l")" \
+        "${C_BOLD}${C_YELLOW}" "$b1" \
+        "$C_WHITE" "$(pad_fixed "$t1" "$tw1")" \
+        "$C_DIM" "$r1" \
         "$C_DIM" \
-        "$C_WHITE" "$(pad_fixed "$rhs" "$col_r")" \
+        "${C_BOLD}${C_YELLOW}" "$b2" \
+        "$C_WHITE" "$(pad_fixed "$t2" "$tw2")" \
+        "$C_DIM" "$r2" \
         "$C_CYAN" "$C_RESET" "$CLR_EOL"
     done
     box_bottom "$C_CYAN"
@@ -1619,23 +1809,41 @@ show_portada() {
 
     ui_blank
     if [ -n "$sinfo" ]; then
-      local s c l col="$C_GREEN" badge=" [LISTO]"
+      local s c l col="$C_GREEN" badge=" [LISTO]" acct_line
       s="$(echo "$sinfo" | cut -d'|' -f1)"; c="$(echo "$sinfo" | cut -d'|' -f2)"; l="$(echo "$sinfo" | cut -d'|' -f3)"
       if awk -v v="${c:-0}" 'BEGIN{exit !(v+0 > 0)}'; then
-        col="$C_YELLOW"; badge=" [REINICIAR CON U->P]"
+        col="$C_YELLOW"
+        if [ "$UI_W" -ge 86 ]; then
+          badge=" [REINICIAR CON U->P]"
+        elif [ "$UI_W" -ge 74 ]; then
+          badge=" [REINICIAR U->P]"
+        else
+          badge=" [U->P]"
+        fi
       fi
-      ui_line "$col" "  Cuenta demo $ORIGEN : saldo=\$$s | hoy=\$$c/\$$l$badge"
+      if [ "$UI_W" -ge 86 ]; then
+        acct_line="  Cuenta demo $ORIGEN : saldo=\$$s | hoy=\$$c/\$$l$badge"
+      elif [ "$UI_W" -ge 74 ]; then
+        acct_line="  Cuenta $ORIGEN: saldo=\$$s | hoy=\$$c/\$$l$badge"
+      else
+        acct_line="  $ORIGEN: saldo=\$$s | hoy=\$$c/\$$l$badge"
+      fi
+      ui_line "$col" "$acct_line"
     elif [ ! -f "$REPO_DIR/.env" ]; then
       ui_line "$C_YELLOW" "  [AVISO] Gateway sin respuesta y falta .env -> [U] -> [C] / [P]"
     else
-      ui_line "$C_DIM" "  Gateway :8080 sin conexion -> Pulsa [U] para iniciar servicios"
+      ui_line "$C_DIM" "  Gateway :8080 sin conexión -> Pulsa [U] para iniciar servicios"
     fi
 
     write_divider
-    local sp="  ► [ESPACIO / ENTER] Iniciar Presentacion (Diapositiva 1/15)"
-    local np="    Atajos: [1-6] Ir a seccion   [B] Eureka   [U] Utilidades   [Q] Salir"
-    [ "$UI_W" -lt 68 ] && sp="  ► [ESPACIO/→] Iniciar Presentacion (1/15)"
-    [ "$UI_W" -lt 74 ] && np="    [1-6] Seccion  [B] Eureka  [U] Utils  [Q] Salir"
+    local sp="  ► [ESPACIO / ENTER] Iniciar Presentación (Diapositiva 1/15)"
+    local np="    Atajos: [1-6] Sección  [B] Eureka  [U] Utilidades  [?] Ayuda  [Q] Salir"
+    [ "$UI_W" -lt 68 ] && sp="  ► [ESPACIO/→] Iniciar Presentación (1/15)"
+    if [ "$UI_W" -lt 72 ]; then
+      np="    [1-6] Sec  [B] Eur  [U] Util  [?] Ayuda  [Q] Salir"
+    elif [ "$UI_W" -lt 84 ]; then
+      np="    [1-6] Sec  [B] Eureka  [U] Utils  [?] Ayuda  [Q] Salir"
+    fi
     ui_line "${C_BOLD}${C_GREEN}" "$sp"
     ui_line "$C_DIM" "$np"
     end_frame
@@ -1643,6 +1851,7 @@ show_portada() {
     read_slide_key_live 1
     case "$ACT" in
       RESIZE)       continue ;;
+      HELP)         show_help_modal; last_sal_poll=0 ;;
       QUIT)         return ;;
       EUREKA)       open_eureka ;;
       DOCK_REFRESH) fetch_dock_sync; update_dock_in_place ;;
