@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Billetera Digital Distribuida · Presentación Interactiva</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="bg-grid" aria-hidden="true"></div>
+  <div class="bg-glow bg-glow-1" aria-hidden="true"></div>
+  <div class="bg-glow bg-glow-2" aria-hidden="true"></div>
+
+  <div class="app-shell">
+    <!-- TOP BAR & LIVE CLUSTER DOCK -->
+    <header class="topbar">
+      <div class="topbar-left">
+        <button id="btn-home" class="brand-pill" title="Volver a Portada [M]">
+          <span class="brand-dot"></span>
+          <span class="brand-title">SPRING WALLET P2P</span>
+        </button>
+        <div class="slide-meta" id="header-slide-meta">
+          <span class="block-tag" id="header-block-tag">PORTADA</span>
+          <span class="slide-counter" id="header-slide-counter">0 / 15</span>
+        </div>
+      </div>
+
+      <div class="cluster-dock" id="cluster-dock" title="Estado de los 8 contenedores Docker en tiempo real">
+        <!-- Populated by JS -->
+      </div>
+
+      <div class="topbar-actions">
+        <div class="mode-switch" role="group" aria-label="Modo de ejecución">
+          <button id="btn-mode-live" class="mode-btn active" title="Ejecutar pruebas reales contra Docker y Gateway">
+            <span class="pulse-live"></span> EN VIVO
+          </button>
+          <button id="btn-mode-sim" class="mode-btn" title="Plan B: simulación instantánea sin depender de Docker">
+            PLAN B · SIMULADO
+          </button>
+        </div>
+
+        <button class="icon-btn" id="btn-script" title="Guion del presentador [G]">
+          <span>🎙</span><span class="btn-lbl">Guion</span><kbd>G</kbd>
+        </button>
+        <button class="icon-btn" id="btn-logs" title="Bitácora y Trazas HTTP [L]">
+          <span>📡</span><span class="btn-lbl">Trazas</span><kbd>L</kbd>
+        </button>
+        <button class="icon-btn" id="btn-utils" title="Utilidades Docker y Eureka [U]">
+          <span>⚙</span><span class="btn-lbl">Utils</span><kbd>U</kbd>
+        </button>
+        <button class="icon-btn accent" id="btn-export" title="Exportar reporte forense Markdown [E]">
+          <span>📄</span><span class="btn-lbl">Exportar</span><kbd>E</kbd>
+        </button>
+        <button class="icon-btn" id="btn-help" title="Atajos de teclado [?]">
+          <span>?</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- PROGRESS BAR -->
+    <div class="progress-track">
+      <div class="progress-fill" id="progress-fill"></div>
+    </div>
+
+    <!-- MAIN CONTENT AREA -->
+    <div class="workspace">
+      <main class="stage-wrap">
+        <section id="slide-stage" class="slide-stage" aria-live="polite">
+          <!-- Slide content rendered dynamically -->
+        </section>
+      </main>
+
+      <!-- PRESENTER SCRIPT DRAWER -->
+      <aside id="script-drawer" class="script-drawer hidden" aria-label="Guion del presentador">
+        <div class="drawer-header">
+          <div>
+            <div class="drawer-eyebrow">GUION DEL PRESENTADOR</div>
+            <h3 id="drawer-slide-title">Portada</h3>
+          </div>
+          <div class="drawer-meta">
+            <span id="drawer-duration" class="dur-badge">~35s</span>
+            <button id="btn-close-script" class="close-btn" title="Cerrar [G]">✕</button>
+          </div>
+        </div>
+        <div class="drawer-body" id="drawer-body">
+          <!-- Populated dynamically -->
+        </div>
+      </aside>
+    </div>
+
+    <!-- FOOTER NAVIGATION -->
+    <footer class="bottombar">
+      <div class="nav-blocks" id="nav-blocks">
+        <button class="blk-pill" data-block="1"><span>1</span> Arq</button>
+        <button class="blk-pill" data-block="2"><span>2</span> Eureka</button>
+        <button class="blk-pill" data-block="3"><span>3</span> ACID</button>
+        <button class="blk-pill" data-block="4"><span>4</span> WAL/RYOW</button>
+        <button class="blk-pill" data-block="5"><span>5</span> Fallos</button>
+        <button class="blk-pill" data-block="6"><span>6</span> Cierre</button>
+      </div>
+
+      <div class="slide-dots" id="slide-dots">
+        <!-- 0..15 dots -->
+      </div>
+
+      <div class="nav-controls">
+        <button id="btn-prev" class="nav-btn" title="Anterior [←]">
+          ← Anterior
+        </button>
+        <button id="btn-refresh" class="nav-btn secondary" title="Re-ejecutar prueba actual [R]">
+          ↻ Re-ejecutar <kbd>R</kbd>
+        </button>
+        <button id="btn-next" class="nav-btn primary" title="Siguiente / Avanzar fase [Espacio o →]">
+          <span id="btn-next-label">Iniciar</span> →
+        </button>
+      </div>
+    </footer>
+  </div>
+
+  <!-- MODAL OVERLAY -->
+  <div id="modal-backdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="modal-title">Modal</h3>
+        <button id="modal-close" class="close-btn">✕</button>
+      </div>
+      <div id="modal-body" class="modal-body"></div>
+    </div>
+  </div>
+
+  <!-- TOAST -->
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
