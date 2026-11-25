@@ -1,3 +1,9 @@
+**Este proyecto es producto de una actividad en clases**
+
+El link al video de presentación se encuentra en:
+
+> https://drive.google.com/file/d/10-gmY0eYT0AMnLySES2HSBplX-U6U11E/view?usp=sharing
+
 # Billetera Digital Distribuida
 
 Billetera P2P con microservicios Spring Boot 3.4.3 (Java 21), descubrimiento con Eureka, API Gateway con balanceo `lb://` y un clúster PostgreSQL 17 (1 primario + 2 réplicas *hot standby* por streaming WAL) con enrutamiento lectura/escritura (CQRS-lite).
