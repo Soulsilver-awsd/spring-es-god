@@ -10,6 +10,13 @@ Este informe reúne en un solo documento la explicación sistemática del sistem
 
 ---
 
+NOTA: **Este proyecto es producto de una actividad en clases**
+
+El link al video de presentación se encuentra en:
+
+> https://drive.google.com/file/d/10-gmY0eYT0AMnLySES2HSBplX-U6U11E/view?usp=sharing
+
+
 ## 1. Fuentes, entorno y convenciones
 
 ### 1.1 Fuentes documentales
@@ -54,10 +61,43 @@ Toda evidencia se identifica con `E##` (reporte `R24`) o `C##` (log `C19`) y se 
 
 ## 2. Arquitectura del sistema desplegado
 
+
 ### 2.1 Diagrama C4 de despliegue
 
-> **ESPACIO RESERVADO — pegar aquí el diagrama C4 de despliegue.**
-> Origen: `docs/sad/05-despliegue-e-infraestructura.md`, sección 1 (`[Deployment Node] Host Anfitrion` → red Docker interna con los nodos de aplicación y los nodos PostgreSQL). El diagrama se inserta tal cual; el texto siguiente lo explica sin depender de la imagen.
+```mermaid
+flowchart TB
+    Host["[Deployment Node] Host Anfitrion\nDocker Engine + Docker Compose v2\nArchivo .env (derivado de .env.example)"]
+
+    subgraph DockerEngine["[Container Runtime] Red Interna Aislada Docker"]
+        subgraph AppNodes["Nodos de Aplicacion (Imagenes JDK 21 Alpine Multi-Etapa)"]
+            EU["[Container] eureka-server\nHost:8761 -> Contenedor:8761"]
+            GW["[Container] api-gateway\nHost:8080 -> Contenedor:8080\ndepends_on: eureka-server"]
+            CTA1["[Container] ms-cuentas-1\nHost:8081 -> Contenedor:8081\ndepends_on: primary, eureka"]
+            CTA2["[Container] ms-cuentas-2\nHost:8082 -> Contenedor:8082\ndepends_on: primary, eureka"]
+            TRX["[Container] ms-transacciones\nHost:8083 -> Contenedor:8083\ndepends_on: primary, eureka"]
+        end
+
+        subgraph DbNodes["Nodos PostgreSQL 17 (WAL Streaming)"]
+            PGP["[Container] primary\nHost:5432 -> Contenedor:5432\nwal_level=replica, max_wal_senders=10,\nwal_keep_size=256MB, hot_standby=on"]
+            PGR1["[Container] replica1\nHost:5433 -> Contenedor:5432\nentrypoint: start-replica.sh"]
+            PGR2["[Container] replica2\nHost:5434 -> Contenedor:5432\nentrypoint: start-replica.sh"]
+
+            V0[("Volumen: primary_data")]
+            V1[("Volumen: replica1_data")]
+            V2[("Volumen: replica2_data")]
+
+            PGP --- V0
+            PGR1 --- V1
+            PGR2 --- V2
+        end
+    end
+
+    Host --> DockerEngine
+    PGP == "pg_basebackup + WAL TCP :5432" ==> PGR1
+    PGP == "pg_basebackup + WAL TCP :5432" ==> PGR2
+```
+
+---
 
 El despliegue es un único host con Docker Engine y Docker Compose v2, con un archivo `.env` derivado de `.env.example`. Dentro de la red interna aislada conviven ocho contenedores: cinco nodos de aplicación construidos con imágenes JDK 21 Alpine multi-etapa y tres nodos PostgreSQL 17 con replicación por *WAL streaming*.
 
